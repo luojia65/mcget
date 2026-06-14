@@ -46,10 +46,8 @@ use rust_i18n::t;
 // file is the locale tag.
 rust_i18n::i18n!("locales");
 
-/// Timeout for a single query attempt.
-/// Auto-detect races Java and Bedrock concurrently, so the worst-case total
-/// for any host is QUERY_TIMEOUT (not twice it).
-const QUERY_TIMEOUT: Duration = Duration::from_secs(6);
+/// Default timeout for a single query attempt (seconds).
+const DEFAULT_TIMEOUT_SECS: u64 = 6;
 
 fn main() {
     // Build the clap Command with runtime-translated help strings. We do this
@@ -76,12 +74,12 @@ fn main() {
     let latency_flag = matches.get_flag("latency");
     let json_flag = matches.get_flag("json");
 
-    // max_time is accepted but per-attempt timeouts are fixed at QUERY_TIMEOUT
-    // (see its docs). A future version can wire max_time through.
-    let _max_time: u64 = matches
-        .get_one::<String>("max_time")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(6);
+    let timeout: Duration = Duration::from_secs(
+        matches
+            .get_one::<String>("max_time")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_TIMEOUT_SECS),
+    );
 
     let exit_code = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -93,6 +91,7 @@ fn main() {
             bedrock_flag,
             latency_flag,
             json_flag,
+            timeout,
         ));
     std::process::exit(exit_code);
 }
@@ -251,6 +250,7 @@ async fn run(
     bedrock_flag: bool,
     latency_flag: bool,
     json_flag: bool,
+    timeout: Duration,
 ) -> i32 {
     use std::collections::HashMap;
     use std::sync::mpsc;
@@ -285,7 +285,7 @@ async fn run(
             let tx = tx.clone();
             let host = host.clone();
             tokio::spawn(async move {
-                let r = query_java(&host, latency_flag)
+                let r = query_java(&host, latency_flag, timeout)
                     .await
                     .map(|(s, l)| QueryResult::Java(s, l));
                 let _ = tx.send((host, "java", r));
@@ -294,7 +294,7 @@ async fn run(
             let tx = tx.clone();
             let host = host.clone();
             tokio::spawn(async move {
-                let r = query_bedrock(&host).await.map(QueryResult::Bedrock);
+                let r = query_bedrock(&host, timeout).await.map(QueryResult::Bedrock);
                 let _ = tx.send((host, "bedrock", r));
             });
         } else {
@@ -303,14 +303,14 @@ async fn run(
             let tx1 = tx.clone();
             let h1 = host.clone();
             tokio::spawn(async move {
-                let r = query_java(&h1, latency_flag)
+                let r = query_java(&h1, latency_flag, timeout)
                     .await
                     .map(|(s, l)| QueryResult::Java(s, l));
                 let _ = tx1.send((h1, "java", r));
             });
             let tx2 = tx.clone();
             tokio::spawn(async move {
-                let r = query_bedrock(&host).await.map(QueryResult::Bedrock);
+                let r = query_bedrock(&host, timeout).await.map(QueryResult::Bedrock);
                 let _ = tx2.send((host, "bedrock", r));
             });
         }
@@ -387,10 +387,10 @@ async fn run(
 async fn query_java(
     host: &str,
     latency_flag: bool,
+    timeout: Duration,
 ) -> Result<(java::StatusResponse, Option<Duration>), PingError> {
     let client = java::Client::new();
-    // Wrap with tokio::time::timeout (the library has no built-in timeout).
-    let pair = tokio::time::timeout(QUERY_TIMEOUT, async {
+    let pair = tokio::time::timeout(timeout, async {
         if latency_flag {
             let (status, latency) = client.ping(host)?.with_latency().send().await?;
             Ok::<_, PingError>((status, Some(latency)))
@@ -405,9 +405,9 @@ async fn query_java(
 }
 
 /// Bedrock Edition query. Returns a PongResponse (which already carries latency).
-async fn query_bedrock(host: &str) -> Result<bedrock::PongResponse, PingError> {
+async fn query_bedrock(host: &str, timeout: Duration) -> Result<bedrock::PongResponse, PingError> {
     let client = bedrock::Client::new();
-    tokio::time::timeout(QUERY_TIMEOUT, async {
+    tokio::time::timeout(timeout, async {
         let resp = client.ping(host)?.send().await?;
         Ok::<_, PingError>(resp)
     })
