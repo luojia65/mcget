@@ -1,0 +1,34 @@
+about: "A curl-like Minecraft server status query tool."
+long_about: "Auto-detects Java vs Bedrock edition; supports human-readable and JSON output."
+hosts_help: "Target address(es), e.g. mc.hypixel.net or play.easecation.net:19132.\nWhen no port is given: Java fills in 25565, Bedrock fills in 19132."
+java_help: "Force querying as Java Edition."
+bedrock_help: "Force querying as Bedrock Edition."
+latency_help: "Measure and show latency (Java does an extra ping/pong round trip)."
+json_help: "Output as JSON (for jq and similar pipelines)."
+max_time_help: "Maximum timeout (in seconds) for a single query."
+
+err_no_target: "Error: at least one target address is required. Use --help for usage."
+err_internal: "Internal error: %{error}"
+failed: "FAILED: %{error}"
+query_timed_out: "query timed out"
+java_query_failed: "Java query failed (%{java_err}); Bedrock query failed (%{bed_err})"
+
+header: "--- %{host} (%{edition}) ---"
+failed_header: "--- %{host} ---"
+
+version_with_protocol: "Version: %{name} (protocol %{protocol})"
+players: "Players: %{online}/%{max}"
+motd: "MOTD: %{motd}"
+latency: "Latency: %{latency}"
+
+favicon_provided: "Favicon: provided (%{count} chars)"
+enforces_secure_chat: "Enforces secure chat: %{value}"
+
+edition_label: "Edition: %{edition}"
+motd2: "MOTD2: %{motd}"
+gamemode: "Gamemode: %{gamemode} (%{numeric})"
+ports: "Ports: IPv4=%{ipv4}, IPv6=%{ipv6}"
+server_guid: "Server GUID: %{guid}"
+
+edition_java: "Java"
+edition_bedrock: "Bedrock"

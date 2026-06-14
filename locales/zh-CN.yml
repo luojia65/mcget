@@ -1,0 +1,34 @@
+about: "一个类似 curl 的 Minecraft 服务器状态查询工具。"
+long_about: "自动识别 Java 版与基岩版；支持易读格式与 JSON 输出。"
+hosts_help: "目标地址，例如 mc.hypixel.net 或 play.easecation.net:19132。\n未指定端口时：Java 版默认使用 25565，基岩版默认使用 19132。"
+java_help: "强制按 Java 版查询。"
+bedrock_help: "强制按基岩版查询。"
+latency_help: "测量并显示延迟（Java 版会额外进行一次 ping/pong 往返）。"
+json_help: "以 JSON 格式输出（便于配合 jq 等工具处理）。"
+max_time_help: "单次查询的最大超时时间（秒）。"
+
+err_no_target: "错误：至少需要一个目标地址。请使用 --help 查看用法。"
+err_internal: "内部错误：%{error}"
+failed: "失败：%{error}"
+query_timed_out: "查询超时"
+java_query_failed: "Java 版查询失败（%{java_err}）；基岩版查询失败（%{bed_err}）"
+
+header: "--- %{host}（%{edition}）---"
+failed_header: "--- %{host} ---"
+
+version_with_protocol: "版本：%{name}（协议 %{protocol}）"
+players: "玩家：%{online}/%{max}"
+motd: "MOTD：%{motd}"
+latency: "延迟：%{latency}"
+
+favicon_provided: "图标：已提供（%{count} 个字符）"
+enforces_secure_chat: "强制安全聊天：%{value}"
+
+edition_label: "版本类型：%{edition}"
+motd2: "MOTD2：%{motd}"
+gamemode: "游戏模式：%{gamemode}（%{numeric}）"
+ports: "端口：IPv4=%{ipv4}，IPv6=%{ipv6}"
+server_guid: "服务器 GUID：%{guid}"
+
+edition_java: "Java"
+edition_bedrock: "基岩"

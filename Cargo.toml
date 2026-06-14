@@ -3,7 +3,7 @@ name = "mcping"
 version = "0.0.0"
 edition = "2021"
 rust-version = "1.70"
-authors = ["ZCode"]
+authors = ["Luo Jia <me@luojia.cc>", "ZCode"]
 license = "MIT OR Apache-2.0"
 description = "A Minecraft server status query library and CLI tool (Java SLP + Bedrock RakNet)"
 repository = "https://github.com/luojia/mcping"
@@ -24,6 +24,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 clap = { version = "4", features = ["derive"] }
+rust-i18n = "3"
+sys-locale = "0.3"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
