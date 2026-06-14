@@ -240,8 +240,11 @@ fn bundled_locales() -> Vec<&'static str> {
     rust_i18n::available_locales!().to_vec()
 }
 
-/// Queries all targets in parallel. Returns the process exit code
-/// (0 = all succeeded, 1 = at least one failed).
+/// Spawns queries for all hosts and prints each **success** as soon as it
+/// resolves. When a host is queried on two protocols in auto-detect mode, a
+/// failure on one protocol is suppressed if the other protocol succeeds; only
+/// when every protocol fails for a given host are the failure messages printed.
+/// Returns the process exit code (0 = all succeeded, 1 = at least one failed).
 async fn run(
     hosts: &[String],
     java_flag: bool,
@@ -249,103 +252,135 @@ async fn run(
     latency_flag: bool,
     json_flag: bool,
 ) -> i32 {
-    let mut handles = Vec::new();
-    for host in hosts {
-        let host = host.clone();
-        let handle = tokio::spawn(async move {
-            let result =
-                query_one(&host, java_flag, bedrock_flag, latency_flag).await;
-            (host, result)
-        });
-        handles.push(handle);
+    use std::collections::HashMap;
+    use std::sync::mpsc;
+
+    /// Per-host bookkeeping while multiple protocol queries are in flight.
+    struct Pending {
+        /// Number of protocol queries still outstanding for this host.
+        remaining: usize,
+        /// Whether at least one success has been seen (and printed).
+        had_success: bool,
+        /// Error strings buffered until we know whether they matter.
+        /// Each entry is (edition_label, error_message).
+        failures: Vec<(&'static str, String)>,
     }
 
+    // Channel carries (host, edition_label, result). The edition is a static
+    // string ("java"/"bedrock") so JSON error objects can declare which protocol
+    // failed; it is `""` for unknown.
+    let (tx, rx) = mpsc::channel::<(String, &'static str, Result<QueryResult, PingError>)>();
+    let mut pending = HashMap::<String, Pending>::new();
+
+    for host in hosts {
+        // Register the host *before* spawning, so the receiver loop finds it.
+        let count = if java_flag || bedrock_flag { 1 } else { 2 };
+        pending.insert(host.clone(), Pending {
+            remaining: count,
+            had_success: false,
+            failures: Vec::new(),
+        });
+
+        if java_flag {
+            let tx = tx.clone();
+            let host = host.clone();
+            tokio::spawn(async move {
+                let r = query_java(&host, latency_flag)
+                    .await
+                    .map(|(s, l)| QueryResult::Java(s, l));
+                let _ = tx.send((host, "java", r));
+            });
+        } else if bedrock_flag {
+            let tx = tx.clone();
+            let host = host.clone();
+            tokio::spawn(async move {
+                let r = query_bedrock(&host).await.map(QueryResult::Bedrock);
+                let _ = tx.send((host, "bedrock", r));
+            });
+        } else {
+            // Auto-detect: fire both concurrently through separate tasks.
+            let host = host.clone(); // move into closures
+            let tx1 = tx.clone();
+            let h1 = host.clone();
+            tokio::spawn(async move {
+                let r = query_java(&h1, latency_flag)
+                    .await
+                    .map(|(s, l)| QueryResult::Java(s, l));
+                let _ = tx1.send((h1, "java", r));
+            });
+            let tx2 = tx.clone();
+            tokio::spawn(async move {
+                let r = query_bedrock(&host).await.map(QueryResult::Bedrock);
+                let _ = tx2.send((host, "bedrock", r));
+            });
+        }
+    }
+
+    // Drop our copy of the sender so the channel closes after all spawned
+    // tasks have finished and dropped their senders.
+    drop(tx);
+
     let mut any_failed = false;
-    for handle in handles {
-        let (host, result) = match handle.await {
-            Ok(pair) => pair,
-            Err(e) => {
-                eprintln!("{}", t!("err_internal", error = e));
-                any_failed = true;
-                continue;
-            }
+
+    for (host, _edition, result) in rx {
+        let state = match pending.get_mut(&host) {
+            Some(s) => s,
+            None => continue, // should never happen
         };
+        state.remaining -= 1;
+
         match result {
-            Ok(results) => {
-                for res in results {
-                    if json_flag {
-                        print_json(&host, &res);
-                    } else {
-                        print_human(&host, &res);
-                    }
+            Ok(res) => {
+                // Success – print it immediately and note we had a success so
+                // that any buffered failures for this host will be discarded.
+                state.had_success = true;
+                if json_flag {
+                    print_json(&host, &res);
+                } else {
+                    print_human(&host, &res);
                 }
             }
             Err(e) => {
-                eprintln!("{}", t!("failed_header", host = host));
-                eprintln!("  {}", t!("failed", error = e));
+                // Buffer the failure; we decide later whether to show it.
+                state.failures.push((_edition, e.to_string()));
+            }
+        }
+
+        // When the last outstanding query for this host lands, either flush
+        // the buffered failures (no success) or discard them (had success).
+        if state.remaining == 0 {
+            if !state.had_success {
+                if json_flag {
+                    for (edition, err) in state.failures.drain(..) {
+                        print_json_error(&host, edition, &err);
+                    }
+                } else {
+                    for (_, err) in state.failures.drain(..) {
+                        eprintln!("{}", t!("failed_header", host = host));
+                        eprintln!("  {}", t!("failed", error = err));
+                    }
+                }
                 any_failed = true;
             }
+            pending.remove(&host);
+        }
+    }
+
+    // Any leftover pending entries (shouldn't happen) are hosts whose tasks
+    // panicked rather than reporting through the channel. Treat them as failed.
+    for (host, state) in pending.drain() {
+        if !state.had_success {
+            if json_flag {
+                print_json_error(&host, "", "task panicked");
+            } else {
+                eprintln!("{}", t!("failed_header", host = host));
+                eprintln!("  {}", t!("err_internal", error = "task panicked"));
+            }
+            any_failed = true;
         }
     }
 
     i32::from(any_failed)
-}
-
-/// Queries a single target. The java/bedrock flags decide the edition, or auto-detect.
-///
-/// On auto-detect: Java and Bedrock are queried concurrently (each with its own
-/// QUERY_TIMEOUT), so the worst-case total is QUERY_TIMEOUT rather than twice it.
-/// If the host answers on both protocols, both results are returned and printed
-/// as if they were separate servers.
-async fn query_one(
-    host: &str,
-    java_flag: bool,
-    bedrock_flag: bool,
-    latency_flag: bool,
-) -> Result<Vec<QueryResult>, PingError> {
-    if java_flag {
-        let (s, l) = query_java(host, latency_flag).await?;
-        Ok(vec![QueryResult::Java(s, l)])
-    } else if bedrock_flag {
-        let r = query_bedrock(host).await?;
-        Ok(vec![QueryResult::Bedrock(r)])
-    } else {
-        // Auto-detect: race both protocols at once instead of trying them in
-        // sequence. Whichever answers wins; a dual-protocol host yields both.
-        let (java_res, bed_res) =
-            tokio::join!(query_java(host, latency_flag), query_bedrock(host));
-
-        let mut results = Vec::new();
-        // Fully consume each Result via match so the borrow checker is happy
-        // and we capture the error string for the both-failed report below.
-        let java_err = match java_res {
-            Ok((s, l)) => {
-                results.push(QueryResult::Java(s, l));
-                None
-            }
-            Err(e) => Some(e.to_string()),
-        };
-        let bed_err = match bed_res {
-            Ok(r) => {
-                results.push(QueryResult::Bedrock(r));
-                None
-            }
-            Err(e) => Some(e.to_string()),
-        };
-
-        if results.is_empty() {
-            // Both failed: report both reasons so the user can tell why.
-            let java_err = java_err.unwrap_or_else(|| "unknown".into());
-            let bed_err = bed_err.unwrap_or_else(|| "unknown".into());
-            return Err(PingError::Protocol(t!(
-                "java_query_failed",
-                java_err = java_err,
-                bed_err = bed_err
-            )
-            .to_string()));
-        }
-        Ok(results)
-    }
 }
 
 /// Java Edition query. Returns (StatusResponse, optional latency).
@@ -495,7 +530,11 @@ fn print_human(host: &str, res: &QueryResult) {
 
 /// JSON output. Serializes the response via serde_json, adding edition/host fields.
 fn print_json(host: &str, res: &QueryResult) {
-    let edition = res.edition_label();
+    // JSON is machine-readable; keep edition identifiers canonical (English).
+    let edition: &str = match res {
+        QueryResult::Java(..) => "Java",
+        QueryResult::Bedrock(_) => "Bedrock",
+    };
     match res {
         QueryResult::Java(status, latency) => {
             let mut obj = serde_json::to_value(status).unwrap_or(serde_json::Value::Null);
@@ -520,4 +559,15 @@ fn print_json(host: &str, res: &QueryResult) {
             println!("{}", serde_json::to_string_pretty(&obj).unwrap_or_default());
         }
     }
+}
+
+/// JSON error output — produces a minimal JSON object suitable for machine
+/// consumption (same style as [`print_json`]).
+fn print_json_error(host: &str, edition: &str, error: &str) {
+    let obj = serde_json::json!({
+        "host": host,
+        "edition": edition,
+        "error": error,
+    });
+    println!("{}", serde_json::to_string(&obj).unwrap_or_default());
 }
