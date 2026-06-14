@@ -1,4 +1,4 @@
-//! `mcping` -- a curl-like command-line tool for querying Minecraft server
+//! `mcget` -- a curl-like command-line tool for querying Minecraft server
 //! status.
 //!
 //! Supports auto-detecting Java vs Bedrock edition, and both human-readable and
@@ -8,21 +8,21 @@
 //!
 //! ```sh
 //! # Auto-detect edition
-//! mcping mc.hypixel.net
-//! mcping play.easecation.net
+//! mcget mc.hypixel.net
+//! mcget play.easecation.net
 //!
 //! # Force an edition
-//! mcping -j mc.hypixel.net
-//! mcping -b play.easecation.net
+//! mcget -j mc.hypixel.net
+//! mcget -b play.easecation.net
 //!
 //! # JSON output (for jq pipelines)
-//! mcping --json mc.hypixel.net
+//! mcget --json mc.hypixel.net
 //!
 //! # Measure latency (Java does an extra ping/pong round trip)
-//! mcping -t mc.hypixel.net
+//! mcget -t mc.hypixel.net
 //!
 //! # Multiple targets + timeout
-//! mcping --max-time 5 mc.hypixel.net play.cubecraft.net
+//! mcget --max-time 5 mc.hypixel.net play.cubecraft.net
 //! ```
 //!
 //! ## Internationalization
@@ -36,9 +36,9 @@
 use std::time::Duration;
 
 use clap::{Arg, ArgAction, Command};
-use mcping::bedrock;
-use mcping::java;
-use mcping::PingError;
+use mcget::bedrock;
+use mcget::java;
+use mcget::PingError;
 use rust_i18n::t;
 
 // Load translations at compile time from the `locales/` directory. Files are

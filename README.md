@@ -1,4 +1,4 @@
-# mcping
+# mcget
 
 [中文](README_zh.md)
 
@@ -7,7 +7,7 @@ A Rust library and command-line tool for querying the status of [Minecraft][mc] 
 - **Java Edition**: the TCP-based [Server List Ping (SLP)][slp] protocol, default port `25565`.
 - **Bedrock Edition**: the UDP-based [RakNet Unconnected Ping][raknet] protocol, default port `19132`.
 
-`mcping` is both a dependable **async Rust library** (using a reqwest-style `Client` + `RequestBuilder` design) and a `curl`-like **command-line tool** that lets players check server status in one line.
+`mcget` is both a dependable **async Rust library** (using a reqwest-style `Client` + `RequestBuilder` design) and a `curl`-like **command-line tool** that lets players check server status in one line.
 
 ---
 
@@ -16,43 +16,43 @@ A Rust library and command-line tool for querying the status of [Minecraft][mc] 
 ### Install
 
 ```sh
-cargo install mcping
+cargo install mcget
 ```
 
 Or build from source:
 
 ```sh
-git clone https://github.com/lojia/mcping
-cd mcping
+git clone https://github.com/lojia/mcget
+cd mcget
 cargo build --release
-# binary at target/release/mcping
+# binary at target/release/mcget
 ```
 
 ### Usage
 
 ```sh
 # Auto-detect edition (try Java first, then Bedrock on failure)
-mcping mc.hypixel.net
-mcping play.easecation.net
+mcget mc.hypixel.net
+mcget play.easecation.net
 
 # Force an edition
-mcping -j mc.hypixel.net          # Java Edition
-mcping -b play.easecation.net     # Bedrock Edition
+mcget -j mc.hypixel.net          # Java Edition
+mcget -b play.easecation.net     # Bedrock Edition
 
 # Measure and show latency (Java does an extra ping/pong round trip)
-mcping -t mc.hypixel.net
+mcget -t mc.hypixel.net
 
 # JSON output (for jq pipelines)
-mcping --json mc.hypixel.net | jq '.players.online'
+mcget --json mc.hypixel.net | jq '.players.online'
 
 # Multiple targets
-mcping mc.hypixel.net play.cubecraft.net play.easecation.net
+mcget mc.hypixel.net play.cubecraft.net play.easecation.net
 
 # Timeout control (seconds)
-mcping --max-time 5 mc.hypixel.net
+mcget --max-time 5 mc.hypixel.net
 
 # Full help
-mcping --help
+mcget --help
 ```
 
 ### Output example
@@ -83,13 +83,13 @@ JSON (`--json`):
 
 ## As a library
 
-`mcping` uses a reqwest-style `Client` + `RequestBuilder` design; fully async, built on [`tokio`][tokio].
+`mcget` uses a reqwest-style `Client` + `RequestBuilder` design; fully async, built on [`tokio`][tokio].
 **The library has no built-in timeout** -- callers compose one with `tokio::time::timeout`.
 
 ### Java Edition
 
 ```rust
-use mcping::java;
+use mcget::java;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -112,7 +112,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ### Bedrock Edition
 
 ```rust
-use mcping::bedrock;
+use mcget::bedrock;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -127,8 +127,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ```rust
 use std::time::Duration;
-use mcping::java::Client;
-use mcping::PingError;
+use mcget::java::Client;
+use mcget::PingError;
 
 # async fn run() -> Result<(), Box<dyn std::error::Error>> {
 let client = Client::new();

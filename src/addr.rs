@@ -38,7 +38,7 @@ use std::net::{SocketAddr, ToSocketAddrs};
 /// # Examples
 ///
 /// ```
-/// use mcping::addr::HostAddr;
+/// use mcget::addr::HostAddr;
 ///
 /// // Tuple form: preserves the original domain.
 /// let addr = ("mc.hypixel.net", 25565);

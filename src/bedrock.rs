@@ -224,7 +224,7 @@ impl RequestBuilder {
 ///
 /// ```no_run
 /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-/// let resp = mcping::ping_bedrock("play.easecation.net").await?;
+/// let resp = mcget::ping_bedrock("play.easecation.net").await?;
 /// println!("{} online {}/{}",
 ///     resp.version_name, resp.player_count, resp.max_players);
 /// # Ok(())
@@ -235,7 +235,7 @@ impl RequestBuilder {
 ///
 /// ```no_run
 /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-/// let resp = mcping::ping_bedrock(("play.easecation.net", 19132)).await?;
+/// let resp = mcget::ping_bedrock(("play.easecation.net", 19132)).await?;
 /// # Ok(())
 /// # }
 /// ```

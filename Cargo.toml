@@ -1,22 +1,22 @@
 [package]
-name = "mcping"
+name = "mcget"
 version = "0.0.0"
 edition = "2021"
 rust-version = "1.70"
 authors = ["Luo Jia <me@luojia.cc>", "ZCode"]
 license = "MIT OR Apache-2.0"
 description = "A Minecraft server status query library and CLI tool (Java SLP + Bedrock RakNet)"
-repository = "https://github.com/luojia/mcping"
+repository = "https://github.com/luojia/mcget"
 keywords = ["minecraft", "ping", "raknet", "bedrock", "slp"]
 categories = ["network-programming", "command-line-utilities", "parser-implementations"]
 
 [lib]
-name = "mcping"
+name = "mcget"
 path = "src/lib.rs"
 
 [[bin]]
-name = "mcping"
-path = "src/bin/mcping.rs"
+name = "mcget"
+path = "src/bin/mcget.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["net", "time", "rt", "rt-multi-thread", "macros", "io-util"] }

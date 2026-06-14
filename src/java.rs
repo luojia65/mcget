@@ -361,7 +361,7 @@ impl LatencyRequestBuilder {
 ///
 /// ```no_run
 /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-/// let status = mcping::ping_java("mc.hypixel.net:25565").await?;
+/// let status = mcget::ping_java("mc.hypixel.net:25565").await?;
 /// println!("{} online {}/{}",
 ///     status.version.name, status.players.online, status.players.max);
 /// # Ok(())
@@ -372,7 +372,7 @@ impl LatencyRequestBuilder {
 ///
 /// ```no_run
 /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-/// let status = mcping::ping_java(("mc.hypixel.net", 25565)).await?;
+/// let status = mcget::ping_java(("mc.hypixel.net", 25565)).await?;
 /// # Ok(())
 /// # }
 /// ```

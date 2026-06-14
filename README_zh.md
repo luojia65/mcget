@@ -1,4 +1,4 @@
-# mcping
+# mcget
 
 [English](README.md)
 
@@ -7,7 +7,7 @@
 - **Java 版**：基于 TCP 的 [Server List Ping (SLP)][slp] 协议，默认端口 `25565`。
 - **Bedrock 版**：基于 UDP 的 [RakNet Unconnected Ping][raknet] 协议，默认端口 `19132`。
 
-`mcping` 既是可依赖的 **异步 Rust 库**（采用 reqwest 风格的 `Client` + `RequestBuilder` 设计），也是一个类 `curl` 的 **命令行工具**，让玩家一行命令查服务器状态。
+`mcget` 既是可依赖的 **异步 Rust 库**（采用 reqwest 风格的 `Client` + `RequestBuilder` 设计），也是一个类 `curl` 的 **命令行工具**，让玩家一行命令查服务器状态。
 
 ---
 
@@ -16,43 +16,43 @@
 ### 安装
 
 ```sh
-cargo install mcping
+cargo install mcget
 ```
 
 或从源码构建：
 
 ```sh
-git clone https://github.com/lojia/mcping
-cd mcping
+git clone https://github.com/lojia/mcget
+cd mcget
 cargo build --release
-# 二进制在 target/release/mcping
+# 二进制在 target/release/mcget
 ```
 
 ### 用法
 
 ```sh
 # 自动探测版本（先试 Java，失败再试 Bedrock）
-mcping mc.hypixel.net
-mcping play.easecation.net
+mcget mc.hypixel.net
+mcget play.easecation.net
 
 # 强制版本
-mcping -j mc.hypixel.net          # Java 版
-mcping -b play.easecation.net     # Bedrock 版
+mcget -j mc.hypixel.net          # Java 版
+mcget -b play.easecation.net     # Bedrock 版
 
 # 测量并显示延迟（Java 版额外 ping/pong 往返）
-mcping -t mc.hypixel.net
+mcget -t mc.hypixel.net
 
 # JSON 输出（方便 jq 管道）
-mcping --json mc.hypixel.net | jq '.players.online'
+mcget --json mc.hypixel.net | jq '.players.online'
 
 # 多目标
-mcping mc.hypixel.net play.cubecraft.net play.easecation.net
+mcget mc.hypixel.net play.cubecraft.net play.easecation.net
 
 # 超时控制（秒）
-mcping --max-time 5 mc.hypixel.net
+mcget --max-time 5 mc.hypixel.net
 
 # 完整帮助
-mcping --help
+mcget --help
 ```
 
 ### 输出示例
@@ -83,13 +83,13 @@ JSON（`--json`）：
 
 ## 作为库使用
 
-`mcping` 采用 reqwest 风格的 `Client` + `RequestBuilder` 设计；全异步，基于 [`tokio`][tokio]。
+`mcget` 采用 reqwest 风格的 `Client` + `RequestBuilder` 设计；全异步，基于 [`tokio`][tokio]。
 **库本身不内置超时**——调用方用 `tokio::time::timeout` 自行组合。
 
 ### Java 版
 
 ```rust
-use mcping::java;
+use mcget::java;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -112,7 +112,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ### Bedrock 版
 
 ```rust
-use mcping::bedrock;
+use mcget::bedrock;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -127,8 +127,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ```rust
 use std::time::Duration;
-use mcping::java::Client;
-use mcping::PingError;
+use mcget::java::Client;
+use mcget::PingError;
 
 # async fn run() -> Result<(), Box<dyn std::error::Error>> {
 let client = Client::new();

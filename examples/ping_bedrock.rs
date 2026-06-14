@@ -22,8 +22,8 @@
 
 use std::time::Duration;
 
-use mcping::bedrock::{Client, PongResponse};
-use mcping::PingError;
+use mcget::bedrock::{Client, PongResponse};
+use mcget::PingError;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

@@ -80,7 +80,7 @@ macro_rules! var_impl {
         /// and [`VarLongRead`]:
         ///
         /// ```
-        /// use mcping::varint::{VarInt, VarIntRead};
+        /// use mcget::varint::{VarInt, VarIntRead};
         /// use std::io::Cursor;
         ///
         /// fn main() {
@@ -140,7 +140,7 @@ macro_rules! var_impl {
         /// and [`VarLongWrite`]:
         ///
         /// ```
-        /// use mcping::varint::{VarInt, VarIntWrite};
+        /// use mcget::varint::{VarInt, VarIntWrite};
         /// use std::io::Cursor;
         ///
         /// fn main() {

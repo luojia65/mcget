@@ -1,4 +1,4 @@
-//! # mcping
+//! # mcget
 //!
 //! An async Rust library and CLI tool for querying the status of Minecraft
 //! servers, supporting two editions:
@@ -16,7 +16,7 @@
 //!
 //! ```no_run
 //! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-//! use mcping::java;
+//! use mcget::java;
 //!
 //! // Option 1: convenience free function (one-shot query).
 //! let status = java::ping(("mc.hypixel.net", 25565)).await?;
@@ -38,7 +38,7 @@
 //!
 //! ```no_run
 //! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-//! use mcping::bedrock;
+//! use mcget::bedrock;
 //!
 //! let resp = bedrock::ping(("play.nethergames.org", 19132)).await?;
 //! println!("{} online {}/{}", resp.version_name, resp.player_count, resp.max_players);

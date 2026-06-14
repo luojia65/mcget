@@ -21,8 +21,8 @@
 
 use std::time::Duration;
 
-use mcping::java::{Client, StatusResponse};
-use mcping::PingError;
+use mcget::java::{Client, StatusResponse};
+use mcget::PingError;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
