@@ -6,7 +6,7 @@ rust-version = "1.70"
 authors = ["Luo Jia <me@luojia.cc>", "ZCode"]
 license = "MIT OR Apache-2.0"
 description = "A Minecraft server status query library and CLI tool (Java SLP + Bedrock RakNet)"
-repository = "https://github.com/luojia/mcget"
+repository = "https://github.com/luojia65/mcget"
 keywords = ["minecraft", "ping", "raknet", "bedrock", "slp"]
 categories = ["network-programming", "command-line-utilities", "parser-implementations"]
 
