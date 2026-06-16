@@ -1,40 +1,32 @@
-//! Minecraft Bedrock / Pocket Edition RakNet Unconnected Ping implementation.
+//! RakNet **Unconnected Ping** — a single UDP round-trip to read a server's
+//! MOTD / player count without establishing a session.
 //!
 //! Follows a reqwest-style [`Client`] + [`RequestBuilder`] pattern: create a
 //! reusable [`Client`], call [`Client::ping`] to get a [`RequestBuilder`], then
 //! call [`RequestBuilder::send`] to issue the request.
 //!
-//! Protocol flow (over UDP, default port 19132):
+//! Protocol flow (over UDP, default port [`super::DEFAULT_PORT`] = 19132):
 //! 1. The client sends an **Unconnected Ping** packet (ID `0x01`):
 //!    `01 | time(u64 BE) | magic(16B) | client_guid(i64 BE)`
 //! 2. The server replies with an **Unconnected Pong** packet (ID `0x1C`):
 //!    `1C | time(u64 BE) | server_guid(i64 BE) | magic(16B) | len(u16 BE) | server_id_string`
 //!
-//! Here `magic` is fixed at `00 ff ff 00 fe fe fe fe fd fd fd fd 12 34 56 78`.
-//! `server_id_string` is a semicolon-separated field string (usually prefixed
-//! with `MCPE;`); its format is documented on [`PongResponse`].
+//! Here `magic` is [`super::MAGIC`]. `server_id_string` is a semicolon-separated
+//! field string (usually prefixed with `MCPE;`); its format is documented on
+//! [`PongResponse`].
 //!
 //! This crate does not build in a timeout; callers can wrap
 //! [`RequestBuilder::send`] with `tokio::time::timeout`.
 //!
 //! References: <https://wiki.bedrock.dev/servers/raknet>, <https://minecraft.wiki/w/RakNet>
 
+use super::*;
+use crate::addr::HostAddr;
+use crate::error::{PingError, Result};
 use serde::Serialize;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
-
 use tokio::net::UdpSocket;
-
-use crate::addr::HostAddr;
-use crate::error::{PingError, Result};
-
-/// Default port for Bedrock Edition.
-pub const DEFAULT_PORT: u16 = 19132;
-
-/// Fixed RakNet offline-message magic (16 bytes).
-pub const MAGIC: [u8; 16] = [
-    0x00, 0xff, 0xff, 0x00, 0xfe, 0xfe, 0xfe, 0xfe, 0xfd, 0xfd, 0xfd, 0xfd, 0x12, 0x34, 0x56, 0x78,
-];
 
 /// Packet ID: Unconnected Ping.
 const ID_UNCONNECTED_PING: u8 = 0x01;
@@ -140,6 +132,35 @@ impl Client {
     /// [`PingError::Io`] is returned).
     pub fn ping<A: HostAddr>(&self, addr: A) -> Result<RequestBuilder> {
         RequestBuilder::new(addr, self.client_guid)
+    }
+
+    /// Returns a [`super::conn::ConnectBuilder`] pre-seeded with this client's
+    /// `client_guid`, ready to run a RakNet handshake.
+    ///
+    /// This is the connection-oriented counterpart of [`Client::ping`]. Unlike
+    /// `ping` (which resolves `addr` immediately), `connect` does **not** take an
+    /// address here — the target is passed to
+    /// [`super::conn::ConnectBuilder::send`], where DNS resolution actually
+    /// happens. So the call reads:
+    ///
+    /// ```no_run
+    /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    /// let client = mcget::bedrock::Client::new().client_guid(12345);
+    /// let conn = client.connect()              // seed config, no I/O yet
+    ///     .send("play.x.net")                  // resolve + handshake
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// The returned builder inherits the client's `client_guid` as its default;
+    /// override it (or any other handshake parameter) by chaining builder
+    /// methods before [`super::conn::ConnectBuilder::send`].
+    pub fn connect(&self) -> super::conn::ConnectBuilder {
+        // DNS resolution is deferred to `ConnectBuilder::send`, matching how
+        // `ConnectBuilder` already works as a standalone entry point. Here we
+        // only seed the client GUID; the address is captured at send time.
+        super::conn::ConnectBuilder::with_client_guid(self.client_guid)
     }
 }
 
@@ -260,37 +281,23 @@ pub async fn ping<A: HostAddr>(addr: A) -> Result<PongResponse> {
 /// `latency` is supplied by the caller (typically the wall-clock delta from
 /// sending the ping to receiving the pong).
 pub fn parse_pong(data: &[u8], latency: Duration) -> Result<PongResponse> {
-    // Minimum valid length: 1 (id) + 8 (time) + 8 (guid) + 16 (magic) + 2 (len) = 35
-    if data.len() < 35 {
-        return Err(PingError::Protocol(format!(
-            "Pong packet too short: {} bytes (need at least 35)",
-            data.len()
-        )));
-    }
-    if data[0] != ID_UNCONNECTED_PONG {
-        return Err(PingError::Protocol(format!(
-            "Pong packet ID is not 0x1C: 0x{:02x}",
-            data[0]
-        )));
-    }
-    let time = i64::from_be_bytes(data[1..9].try_into().unwrap());
-    let server_guid = i64::from_be_bytes(data[9..17].try_into().unwrap());
-    let magic = &data[17..33];
-    if magic != MAGIC {
-        return Err(PingError::Protocol(format!(
-            "Pong packet magic mismatch: {:02x?}",
-            magic
-        )));
-    }
-    let str_len = u16::from_be_bytes([data[33], data[34]]) as usize;
-    let str_start = 35;
-    if data.len() < str_start + str_len {
-        return Err(PingError::Protocol(format!(
+    // Layout: id(1) | time(8) | server_guid(8) | magic(16) | str_len(2) | str(str_len).
+    let mut p = super::PacketBuf::new(data, "Pong");
+    p.expect_id(ID_UNCONNECTED_PONG)?;
+    let time = p.read_i64()?;
+    let server_guid = p.read_i64()?;
+    p.read_magic()?;
+    let str_len = p.read_u16()? as usize;
+    let str_bytes = p.read_bytes(str_len).map_err(|e| match e {
+        // Replace the generic truncation message with a more specific one for
+        // the trailing server_id_string field.
+        PingError::Protocol(_) => PingError::Protocol(format!(
             "server_id_string declares {str_len} bytes but only {} remain",
-            data.len() - str_start
-        )));
-    }
-    let raw = std::str::from_utf8(&data[str_start..str_start + str_len])
+            p.remaining()
+        )),
+        other => other,
+    })?;
+    let raw = std::str::from_utf8(str_bytes)
         .map_err(|e| PingError::Protocol(format!("server_id_string is not UTF-8: {e}")))?;
     let mut resp = parse_server_id_string(raw)?;
     resp.time = time;

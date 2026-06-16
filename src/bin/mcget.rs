@@ -192,10 +192,7 @@ fn resolve_locale(explicit: Option<&str>) -> String {
         }
         // Try matching the language part alone (e.g. "zh-TW" -> "zh-CN").
         if let Some(lang) = normalized.split('-').next() {
-            if let Some(matched) = bundled
-                .iter()
-                .find(|b| b.split('-').next() == Some(lang))
-            {
+            if let Some(matched) = bundled.iter().find(|b| b.split('-').next() == Some(lang)) {
                 return (*matched).to_string();
             }
         }
@@ -207,10 +204,7 @@ fn resolve_locale(explicit: Option<&str>) -> String {
             return normalized;
         }
         if let Some(lang) = normalized.split('-').next() {
-            if let Some(matched) = bundled
-                .iter()
-                .find(|b| b.split('-').next() == Some(lang))
-            {
+            if let Some(matched) = bundled.iter().find(|b| b.split('-').next() == Some(lang)) {
                 return (*matched).to_string();
             }
         }
@@ -275,11 +269,14 @@ async fn run(
     for host in hosts {
         // Register the host *before* spawning, so the receiver loop finds it.
         let count = if java_flag || bedrock_flag { 1 } else { 2 };
-        pending.insert(host.clone(), Pending {
-            remaining: count,
-            had_success: false,
-            failures: Vec::new(),
-        });
+        pending.insert(
+            host.clone(),
+            Pending {
+                remaining: count,
+                had_success: false,
+                failures: Vec::new(),
+            },
+        );
 
         if java_flag {
             let tx = tx.clone();
@@ -294,7 +291,9 @@ async fn run(
             let tx = tx.clone();
             let host = host.clone();
             tokio::spawn(async move {
-                let r = query_bedrock(&host, timeout).await.map(QueryResult::Bedrock);
+                let r = query_bedrock(&host, timeout)
+                    .await
+                    .map(QueryResult::Bedrock);
                 let _ = tx.send((host, "bedrock", r));
             });
         } else {
@@ -310,7 +309,9 @@ async fn run(
             });
             let tx2 = tx.clone();
             tokio::spawn(async move {
-                let r = query_bedrock(&host, timeout).await.map(QueryResult::Bedrock);
+                let r = query_bedrock(&host, timeout)
+                    .await
+                    .map(QueryResult::Bedrock);
                 let _ = tx2.send((host, "bedrock", r));
             });
         }
@@ -457,16 +458,10 @@ fn print_human(host: &str, res: &QueryResult) {
                 t!("motd", motd = status.description.to_plain_text())
             );
             if let Some(favicon) = &status.favicon {
-                println!(
-                    "  {}",
-                    t!("favicon_provided", count = favicon.len())
-                );
+                println!("  {}", t!("favicon_provided", count = favicon.len()));
             }
             if let Some(secure) = status.enforces_secure_chat {
-                println!(
-                    "  {}",
-                    t!("enforces_secure_chat", value = secure)
-                );
+                println!("  {}", t!("enforces_secure_chat", value = secure));
             }
             if let Some(lat) = latency {
                 println!("  {}", t!("latency", latency = format!("{:.1?}", lat)));
@@ -489,10 +484,7 @@ fn print_human(host: &str, res: &QueryResult) {
                     max = resp.max_players
                 )
             );
-            println!(
-                "  {}",
-                t!("edition_label", edition = &resp.edition)
-            );
+            println!("  {}", t!("edition_label", edition = &resp.edition));
             println!("  {}", t!("motd", motd = &resp.motd));
             if !resp.second_motd.is_empty() {
                 println!("  {}", t!("motd2", motd = &resp.second_motd));
@@ -508,17 +500,10 @@ fn print_human(host: &str, res: &QueryResult) {
             if resp.port_ipv4 != 0 || resp.port_ipv6 != 0 {
                 println!(
                     "  {}",
-                    t!(
-                        "ports",
-                        ipv4 = resp.port_ipv4,
-                        ipv6 = resp.port_ipv6
-                    )
+                    t!("ports", ipv4 = resp.port_ipv4, ipv6 = resp.port_ipv6)
                 );
             }
-            println!(
-                "  {}",
-                t!("server_guid", guid = resp.server_guid)
-            );
+            println!("  {}", t!("server_guid", guid = resp.server_guid));
             println!(
                 "  {}",
                 t!("latency", latency = format!("{:.1?}", resp.latency))
