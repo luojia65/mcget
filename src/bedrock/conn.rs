@@ -51,7 +51,7 @@
 use super::*;
 use crate::addr::HostAddr;
 use crate::error::{PingError, Result};
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{SocketAddr, SocketAddrV4};
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
@@ -79,20 +79,12 @@ const ID_NO_FREE_INCOMING: u8 = 0x0c;
 /// Receive buffer for handshake packets.
 const RECV_BUF_LEN: usize = 2048;
 
-/// RakNet IPv4 system address wire length (used in Request 2 / Reply 2):
-/// `family(1) | ipv4(4 BE) | port(2 BE)` = 7 bytes.
-///
-/// Note this is the *offline handshake* address encoding — it is a compact
-/// fixed 7-byte form with a 1-byte family, not the full `SystemAddress` struct
-/// (which in the datagram layer can be longer and carry a scope id). This was
-/// previously mis-sized as 16, which truncated Reply 2 parsing on real servers
-/// (e.g. EaseCation / NetherGames send a 35-byte Reply 2).
-const RAKNET_IPV4_LEN: usize = 7;
-/// Family byte for RakNet IPv4 addresses (RakNet uses 4, not AF_INET).
-const RAKNET_FAMILY_IPV4: u8 = 4;
-
 /// Minimum safe MTU for the RakNet handshake (Ethernet minimum payload minus headers).
 const MIN_MTU: u16 = 46;
+
+// IPv4 system-address codec (`encode_ipv4_addr` / `decode_ipv4_addr`) lives in
+// [`super::raknet`] now — it is a shared wire-format primitive reused by both
+// the Request 2 builder and the Reply 2 parser below.
 
 // ==================== Parsed reply structs ====================
 
@@ -541,10 +533,10 @@ fn build_request1(protocol_version: u8, mtu: u16) -> Vec<u8> {
 /// Builds an Open Connection Request 2 (0x07):
 /// `id | magic | client_addr(7) | mtu(u16 BE) | client_guid(i64 BE)`.
 fn build_request2(client_addr: SocketAddrV4, mtu: u16, client_guid: i64) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(1 + MAGIC.len() + RAKNET_IPV4_LEN + 2 + 8);
+    let mut buf = Vec::with_capacity(1 + MAGIC.len() + super::raknet::RAKNET_IPV4_LEN + 2 + 8);
     buf.push(ID_OPEN_CONN_REQ_2);
     buf.extend_from_slice(&MAGIC);
-    buf.extend_from_slice(&encode_ipv4_addr(&client_addr));
+    buf.extend_from_slice(&super::raknet::encode_ipv4_addr(&client_addr));
     buf.extend_from_slice(&mtu.to_be_bytes());
     buf.extend_from_slice(&client_guid.to_be_bytes());
     buf
@@ -564,7 +556,7 @@ fn parse_reply1(data: &[u8]) -> Result<Option<Reply1>> {
         return Ok(None);
     }
     // Layout: id(1) + magic(16) + server_guid(8) + use_encryption(1) + mtu(2) = 28.
-    let mut p = PacketBuf::new(data, "Reply 1");
+    let mut p = super::raknet::PacketBuf::new(data, "Reply 1");
     p.expect_id(ID_OPEN_CONN_REPL_1)?;
     p.read_magic()?;
     let server_guid = p.read_i64()?;
@@ -587,11 +579,13 @@ fn parse_reply2(data: &[u8]) -> Result<Option<Reply2>> {
         return Ok(None);
     }
     // Layout: id(1) + magic(16) + server_guid(8) + client_addr(7) + mtu(2) + use_encryption(1) = 35.
-    let mut p = PacketBuf::new(data, "Reply 2");
+    let mut p = super::raknet::PacketBuf::new(data, "Reply 2");
     p.expect_id(ID_OPEN_CONN_REPL_2)?;
     p.read_magic()?;
     let server_guid = p.read_i64()?;
-    let client_addr = SocketAddr::V4(decode_ipv4_addr(p.read_bytes(RAKNET_IPV4_LEN)?)?);
+    let client_addr = SocketAddr::V4(super::raknet::decode_ipv4_addr(
+        p.read_bytes(super::raknet::RAKNET_IPV4_LEN)?,
+    )?);
     let mtu = p.read_u16()?;
     let use_encryption = p.read_u8()? != 0;
     Ok(Some(Reply2 {
@@ -611,7 +605,7 @@ fn parse_reply2(data: &[u8]) -> Result<Option<Reply2>> {
 /// `Ok(None)` rather than an error — matching how the handshake loop treats
 /// any unrecognized packet as "keep waiting".
 fn classify_rejection(data: &[u8]) -> Result<Option<HandshakeRejection>> {
-    let mut p = PacketBuf::new(data, "Rejection");
+    let mut p = super::raknet::PacketBuf::new(data, "Rejection");
     let id = match p.peek_u8() {
         Some(id) => id,
         None => return Ok(None), // empty buffer
@@ -638,82 +632,15 @@ fn classify_rejection(data: &[u8]) -> Result<Option<HandshakeRejection>> {
     }
 }
 
-// ==================== RakNet IPv4 address codec ====================
-
-/// Encodes a [`SocketAddrV4`] into the 7-byte RakNet offline system-address
-/// form: `family(1, =4) | ipv4(4 BE) | port(2 BE)`.
-fn encode_ipv4_addr(addr: &SocketAddrV4) -> [u8; RAKNET_IPV4_LEN] {
-    let mut out = [0u8; RAKNET_IPV4_LEN];
-    out[0] = RAKNET_FAMILY_IPV4;
-    out[1..5].copy_from_slice(&addr.ip().octets());
-    out[5..7].copy_from_slice(&addr.port().to_be_bytes());
-    out
-}
-
-/// Decodes a 7-byte RakNet offline system-address slice back into a
-/// [`SocketAddrV4`].
-///
-/// Returns `Err` if the slice is the wrong length or the family byte is not 4.
-fn decode_ipv4_addr(data: &[u8]) -> Result<SocketAddrV4> {
-    if data.len() != RAKNET_IPV4_LEN {
-        return Err(PingError::Protocol(format!(
-            "RakNet address is {} bytes, expected {RAKNET_IPV4_LEN}",
-            data.len()
-        )));
-    }
-    if data[0] != RAKNET_FAMILY_IPV4 {
-        return Err(PingError::Protocol(format!(
-            "RakNet address family {} is not IPv4 (4)",
-            data[0]
-        )));
-    }
-    let ip = Ipv4Addr::new(data[1], data[2], data[3], data[4]);
-    let port = u16::from_be_bytes([data[5], data[6]]);
-    Ok(SocketAddrV4::new(ip, port))
-}
-
 // ==================== Tests ====================
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The IPv4 system-address encoder now lives in the shared `raknet` module;
+    // pull it in unqualified so the test bodies stay readable.
+    use super::super::raknet::encode_ipv4_addr;
     use std::net::Ipv4Addr;
-
-    #[test]
-    fn raknet_ipv4_addr_roundtrip() {
-        let cases = [
-            (Ipv4Addr::new(127, 0, 0, 1), 19132u16),
-            (Ipv4Addr::new(8, 8, 8, 8), 53),
-            (Ipv4Addr::new(192, 168, 1, 1), 0),
-            (Ipv4Addr::new(0, 0, 0, 0), 65535),
-        ];
-        for (ip, port) in cases {
-            let addr = SocketAddrV4::new(ip, port);
-            let encoded = encode_ipv4_addr(&addr);
-            // 7 bytes: family(1) + octets(4) + BE port(2).
-            assert_eq!(encoded.len(), RAKNET_IPV4_LEN);
-            assert_eq!(encoded[0], RAKNET_FAMILY_IPV4);
-            assert_eq!(&encoded[1..5], &ip.octets());
-            assert_eq!(&encoded[5..7], &port.to_be_bytes());
-            let decoded = decode_ipv4_addr(&encoded).unwrap();
-            assert_eq!(decoded, addr, "roundtrip failed for {ip}:{port}");
-        }
-    }
-
-    #[test]
-    fn decode_ipv4_addr_rejects_wrong_length() {
-        assert!(decode_ipv4_addr(&[0u8; 6]).is_err());
-        assert!(decode_ipv4_addr(&[0u8; 8]).is_err());
-    }
-
-    #[test]
-    fn decode_ipv4_addr_rejects_wrong_family() {
-        // Family byte 6 = IPv6, not supported.
-        let mut buf = vec![6u8];
-        buf.resize(RAKNET_IPV4_LEN, 0);
-        assert_eq!(buf.len(), RAKNET_IPV4_LEN);
-        assert!(decode_ipv4_addr(&buf).is_err());
-    }
 
     #[test]
     fn parse_reply1_valid() {

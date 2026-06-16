@@ -282,7 +282,7 @@ pub async fn ping<A: HostAddr>(addr: A) -> Result<PongResponse> {
 /// sending the ping to receiving the pong).
 pub fn parse_pong(data: &[u8], latency: Duration) -> Result<PongResponse> {
     // Layout: id(1) | time(8) | server_guid(8) | magic(16) | str_len(2) | str(str_len).
-    let mut p = super::PacketBuf::new(data, "Pong");
+    let mut p = super::raknet::PacketBuf::new(data, "Pong");
     p.expect_id(ID_UNCONNECTED_PONG)?;
     let time = p.read_i64()?;
     let server_guid = p.read_i64()?;
