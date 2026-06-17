@@ -247,6 +247,15 @@ impl Connection {
         self.mtu
     }
 
+    /// Consumes the connection and returns the owned UDP socket, severing the
+    /// session from this type. Used by [`super::reliable_conn::ReliableConnection`]
+    /// to drive the socket through a reliability engine. Callers that want to
+    /// keep using [`send_datagram`](Self::send_datagram) /
+    /// [`recv_raw`](Self::recv_raw) should not call this.
+    pub fn into_socket(self) -> UdpSocket {
+        self.socket
+    }
+
     /// Whether the server requested packet encryption for this session.
     pub fn use_encryption(&self) -> bool {
         self.use_encryption

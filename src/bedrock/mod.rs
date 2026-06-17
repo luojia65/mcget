@@ -29,6 +29,12 @@ mod raknet;
 // Public so `Connection::send_datagram` / `recv_raw` callers can build
 // datagrams and inspect incoming packets.
 pub mod datagram;
+// Reliability state machine (pure logic): sequence numbers, ACK/NACK tracking,
+// retransmission, ordered delivery. Internal.
+mod reliability;
+// Async reliable transport wrapper around `Connection`: the send/receive loop
+// that drives the reliability engine.
+pub mod reliable_conn;
 
 pub use ping::{ping as ping_bedrock_inner, Client, PongResponse, RequestBuilder};
 // MAGIC is defined in `raknet` and surfaced here so the public path

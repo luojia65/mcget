@@ -19,7 +19,7 @@ name = "mcget"
 path = "src/bin/mcget.rs"
 
 [dependencies]
-tokio = { version = "1", features = ["net", "time", "rt", "rt-multi-thread", "macros", "io-util"] }
+tokio = { version = "1", features = ["net", "time", "rt", "rt-multi-thread", "macros", "io-util", "sync"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

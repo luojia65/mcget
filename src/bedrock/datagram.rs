@@ -20,6 +20,9 @@
 //!            | [sequence_index (u24 LE)]  if sequenced
 //!            | [order_index    (u24 LE)]  if ordered
 //!            | [order_channel  (u8)]      if ordered
+//!            | [split_count (u32 BE)]     if split   -- NB: these three are BE,
+//!            | [split_id    (u16 BE)]     if split      unlike the LE index fields
+//!            | [split_index (u32 BE)]     if split
 //!            | body(body_length_bits / 8 bytes)
 //!
 //! ACK/NACK:  flag(0xC0 ACK | 0xA0 NACK)
@@ -30,12 +33,13 @@
 //!
 //! ## Scope
 //!
-//! This module is **pure encode/decode** — no socket I/O, no reliability state
-//! machine, no retransmission, no ordered-delivery queue, no heartbeat timers.
-//! A future send/receive layer will build on top of it. Frame split/fragment is
-//! **not** supported: encoding never splits, and decoding returns an error on a
-//! frame with the split flag set (the small system packets we send today —
-//! Connected Ping, Disconnect — always fit in one frame).
+//! This module is the connected-layer **wire format** — encode/decode for
+//! datagrams, frames (including split/fragment fields), and ACK/NACK packets.
+//! It is pure code with no socket I/O. Frame splitting and reassembly are
+//! provided as pure functions ([`Frame::split_into`] / [`Reassembler`]); the
+//! reliability state machine (ACK tracking, retransmission, ordered delivery)
+//! lives in [`super::reliability`], and the async send/receive wrapper in
+//! [`super::reliable_conn`].
 //!
 //! All items are `pub(crate)`: internal implementation detail. The
 //! `dead_code` allowance below silences the (expected) "never used" warnings:
@@ -54,6 +58,7 @@
 
 use super::raknet::PacketBuf;
 use crate::error::{PingError, Result};
+use std::collections::BTreeMap;
 
 // ==================== Constants ====================
 
@@ -135,7 +140,7 @@ impl Reliability {
     }
 
     /// Whether frames of this reliability carry a `reliable_index` (u24 LE).
-    fn is_reliable(self) -> bool {
+    pub(crate) fn is_reliable(self) -> bool {
         matches!(
             self,
             Reliability::Reliable | Reliability::ReliableOrdered | Reliability::ReliableSequenced
@@ -143,7 +148,7 @@ impl Reliability {
     }
 
     /// Whether frames of this reliability carry a `sequence_index` (u24 LE).
-    fn is_sequenced(self) -> bool {
+    pub(crate) fn is_sequenced(self) -> bool {
         matches!(
             self,
             Reliability::UnreliableSequenced | Reliability::ReliableSequenced
@@ -151,7 +156,7 @@ impl Reliability {
     }
 
     /// Whether frames of this reliability carry an `order_index` + `order_channel`.
-    fn is_ordered(self) -> bool {
+    pub(crate) fn is_ordered(self) -> bool {
         matches!(
             self,
             Reliability::UnreliableSequenced
@@ -167,7 +172,9 @@ impl Reliability {
 ///
 /// The index fields are `Option` and only populated when the
 /// [`Reliability`] calls for them; the encoder emits/omits them accordingly,
-/// so a freshly-decoded frame round-trips byte-for-byte.
+/// so a freshly-decoded frame round-trips byte-for-byte. The split fields are
+/// likewise `Option`: `Some` only on fragment frames produced by
+/// [`Frame::split_into`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
     reliability: Reliability,
@@ -181,8 +188,26 @@ pub struct Frame {
     /// when ordered; kept unconditionally so a decoded frame is a faithful
     /// representation of what was on the wire.
     order_channel: u8,
+    /// Split metadata (`Some` only for fragment frames). When present, `body`
+    /// is one slice of a larger payload; [`Reassembler`] collects the slices
+    /// keyed by `split_id` and concatenates them in `split_index` order.
+    split: Option<SplitInfo>,
     /// The encapsulated payload (application bytes or a RakNet system message).
     body: Vec<u8>,
+}
+
+/// The three split/fragment header fields, present only on fragment frames.
+///
+/// Wire encoding is **big-endian** for all three (unlike the LE index fields) —
+/// see go-raknet `packet.go` (`binary.BigEndian.Uint32/Uint16`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SplitInfo {
+    /// Total number of fragments the original payload was split into.
+    pub count: u32,
+    /// Identifier shared by all fragments of the same original payload.
+    pub id: u16,
+    /// Zero-based position of this fragment within the split group.
+    pub index: u32,
 }
 
 impl Frame {
@@ -196,6 +221,7 @@ impl Frame {
             sequence_index: None,
             order_index: None,
             order_channel: 0,
+            split: None,
             body,
         }
     }
@@ -216,13 +242,19 @@ impl Frame {
         self.order_channel = channel;
         self
     }
+    /// Marks this frame as a fragment of a larger payload.
+    pub fn with_split(mut self, split: SplitInfo) -> Self {
+        self.split = Some(split);
+        self
+    }
 
     /// Encodes this frame into a freshly-allocated byte buffer.
     ///
     /// Layout: `flags | body_length_bits(u16 BE) | [reliable_index] |
-    /// [sequence_index] | [order_index] | [order_channel] | body`. The length
-    /// field carries the body size **in bits** (per RakNet's wire format), and
-    /// the split flag is always 0 (splitting is not supported).
+    /// [sequence_index] | [order_index] | [order_channel] | [split_count |
+    /// split_id | split_index] | body`. The length field carries the body size
+    /// **in bits** (per RakNet's wire format). The split fields (if present)
+    /// are big-endian, unlike the LE index fields.
     pub(crate) fn encode(&self) -> Result<Vec<u8>> {
         // Validate the index values fit in 24 bits and are consistent with the
         // reliability (a wrong combination would produce a malformed frame that
@@ -286,9 +318,10 @@ impl Frame {
                 ))
             })?;
 
-        let mut buf = Vec::with_capacity(3 + self.body.len() + 10);
-        // Flags byte: reliability in the top 3 bits, split bit (4) always 0.
-        buf.push((self.reliability.as_raw() << 5) | (0 << FRAME_SPLIT_BIT));
+        let mut buf = Vec::with_capacity(3 + self.body.len() + 20);
+        // Flags byte: reliability in the top 3 bits, split bit set if present.
+        let split_flag = if self.split.is_some() { 1 << FRAME_SPLIT_BIT } else { 0 };
+        buf.push((self.reliability.as_raw() << 5) | split_flag);
         buf.extend_from_slice(&body_bits.to_be_bytes());
         if let Some(idx) = self.reliable_index {
             buf.extend_from_slice(&write_u24_le(idx));
@@ -299,6 +332,12 @@ impl Frame {
         if let Some(idx) = self.order_index {
             buf.extend_from_slice(&write_u24_le(idx));
             buf.push(self.order_channel);
+        }
+        // Split fields are big-endian (unlike the LE index fields above).
+        if let Some(split) = self.split {
+            buf.extend_from_slice(&split.count.to_be_bytes());
+            buf.extend_from_slice(&split.id.to_be_bytes());
+            buf.extend_from_slice(&split.index.to_be_bytes());
         }
         buf.extend_from_slice(&self.body);
         Ok(buf)
@@ -315,11 +354,6 @@ impl Frame {
         let flags = buf.read_u8()?;
         let reliability = Reliability::from_raw(flags >> 5)?;
         let is_split = (flags >> FRAME_SPLIT_BIT) & 1 == 1;
-        if is_split {
-            return Err(PingError::Protocol(
-                "frame split/fragment is not supported yet".to_string(),
-            ));
-        }
 
         // The length field is the body size in bits (BE u16) — convert to bytes
         // with `>> 3`. It must be a whole number of bytes; a non-multiple-of-8
@@ -347,6 +381,15 @@ impl Frame {
         } else {
             (None, 0)
         };
+        // Split fields are big-endian (unlike the LE index fields above).
+        let split = if is_split {
+            let count = read_be_u32(buf)?;
+            let id = read_be_u16(buf)?;
+            let index = read_be_u32(buf)?;
+            Some(SplitInfo { count, id, index })
+        } else {
+            None
+        };
         let body = buf.read_bytes(body_len)?.to_vec();
 
         Ok(Some(Self {
@@ -355,6 +398,7 @@ impl Frame {
             sequence_index,
             order_index,
             order_channel,
+            split,
             body,
         }))
     }
@@ -380,9 +424,43 @@ impl Frame {
     pub fn order_channel(&self) -> u8 {
         self.order_channel
     }
+    /// The split metadata (`Some` only for fragment frames).
+    pub fn split(&self) -> Option<SplitInfo> {
+        self.split
+    }
     /// The encapsulated payload (application bytes or a RakNet system message).
     pub fn body(&self) -> &[u8] {
         &self.body
+    }
+
+    /// Produces a copy of this frame stripped of its split metadata and body,
+    /// keeping only the reliability/index header. Used as the "template" the
+    /// reliability layer fills with a reassembled body once all fragments of a
+    /// split group have arrived.
+    pub(crate) fn reassembly_template(&self) -> Frame {
+        Frame {
+            reliability: self.reliability,
+            reliable_index: self.reliable_index,
+            sequence_index: self.sequence_index,
+            order_index: self.order_index,
+            order_channel: self.order_channel,
+            split: None,
+            body: Vec::new(),
+        }
+    }
+
+    /// Returns a copy of this template frame with its body replaced by `body`.
+    /// Counterpart to [`reassembly_template`](Self::reassembly_template).
+    pub(crate) fn with_body(&self, body: Vec<u8>) -> Frame {
+        Frame {
+            reliability: self.reliability,
+            reliable_index: self.reliable_index,
+            sequence_index: self.sequence_index,
+            order_index: self.order_index,
+            order_channel: self.order_channel,
+            split: None,
+            body,
+        }
     }
 }
 
@@ -648,6 +726,149 @@ fn write_u24_le(value: u32) -> [u8; 3] {
     [bytes[0], bytes[1], bytes[2]]
 }
 
+/// Reads a big-endian `u16` from the cursor and advances.
+fn read_be_u16(buf: &mut PacketBuf<'_>) -> Result<u16> {
+    // PacketBuf::read_u16 is already big-endian; reuse it.
+    buf.read_u16()
+}
+
+/// Reads a big-endian `u32` from the cursor and advances.
+fn read_be_u32(buf: &mut PacketBuf<'_>) -> Result<u32> {
+    let bytes = buf.read_bytes(4)?;
+    Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+// ==================== Frame splitting / reassembly ====================
+
+/// Per-frame overhead (bytes) that every fragment pays on top of its body, used
+/// to compute how large a body slice fits under the MTU:
+/// `flags(1) + body_len_bits(2) + reliable_index(3) + order_index(3) +
+///  order_channel(1) + split_count(4) + split_id(2) + split_index(4)` = 20.
+/// (We always assume a reliable-ordered split frame, the worst case.)
+pub(crate) const FRAME_HEADER_MAX_OVERHEAD: usize = 20;
+
+impl Frame {
+    /// Splits a payload that is too large for a single frame into multiple
+    /// fragment [`Frame`]s, each carrying a body slice of at most
+    /// `max_body_bytes`. The caller supplies the reliability and the index
+    /// fields that every fragment shares (the reliability header is identical
+    /// across fragments; only `split_index` differs).
+    ///
+    /// Returns the list of fragments, in `split_index` order. The number of
+    /// fragments is recorded as `SplitInfo::count` on each. If `body` already
+    /// fits in one frame (`body.len() <= max_body_bytes`), a single non-split
+    /// frame is returned.
+    ///
+    /// This is a pure function — it allocates sequence numbers for neither the
+    /// datagram nor the reliable/order indices; the caller (reliability layer)
+    /// fills those in. `reliable_index` / `order` set on the template frame are
+    /// copied verbatim to every fragment.
+    pub(crate) fn split_into(
+        template: &Frame,
+        max_body_bytes: usize,
+        split_id: u16,
+    ) -> Result<Vec<Frame>> {
+        if max_body_bytes == 0 {
+            return Err(PingError::Protocol(
+                "cannot split a frame with a zero-byte MTU budget".to_string(),
+            ));
+        }
+        let body = &template.body;
+        if body.len() <= max_body_bytes {
+            // Fits in one frame — emit a single non-split frame.
+            return Ok(vec![template.clone()]);
+        }
+        let count = body.len().div_ceil(max_body_bytes);
+        let count_u32 = u32::try_from(count).map_err(|_| {
+            PingError::Protocol(format!("too many split fragments: {count}"))
+        })?;
+        let mut fragments = Vec::with_capacity(count);
+        for (index, chunk) in body.chunks(max_body_bytes).enumerate() {
+            let split = SplitInfo {
+                count: count_u32,
+                id: split_id,
+                index: index as u32,
+            };
+            fragments.push(Frame {
+                reliability: template.reliability,
+                reliable_index: template.reliable_index,
+                sequence_index: template.sequence_index,
+                order_index: template.order_index,
+                order_channel: template.order_channel,
+                split: Some(split),
+                body: chunk.to_vec(),
+            });
+        }
+        Ok(fragments)
+    }
+}
+
+/// Collects fragment [`Frame`]s that share a `split_id` and reassembles the
+/// original payload once all `count` fragments have arrived.
+///
+/// Fragments are buffered by `split_index`; when the set is complete the body
+/// slices are concatenated in index order. Use one `Reassembler` per
+/// outstanding split group (keyed by `split_id`).
+#[derive(Debug, Default)]
+pub(crate) struct Reassembler {
+    fragments: BTreeMap<u32, Vec<u8>>,
+    count: u32,
+}
+
+impl Reassembler {
+    /// Creates an empty reassembler.
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds a fragment. Returns `Some(reassembled_body)` once the final fragment
+    /// needed to complete the group is added (the body slices concatenated in
+    /// `split_index` order), or `None` if more fragments are still missing.
+    ///
+    /// A fragment whose `split_index >= split.count` is rejected as malformed,
+    /// as is a duplicate index.
+    pub(crate) fn add(&mut self, split: SplitInfo, body: Vec<u8>) -> Result<Option<Vec<u8>>> {
+        if split.count == 0 {
+            return Err(PingError::Protocol(
+                "split frame declares count=0".to_string(),
+            ));
+        }
+        if split.index >= split.count {
+            return Err(PingError::Protocol(format!(
+                "split_index {} >= split_count {}",
+                split.index, split.count
+            )));
+        }
+        if self.fragments.contains_key(&split.index) {
+            return Err(PingError::Protocol(format!(
+                "duplicate split fragment index {}",
+                split.index
+            )));
+        }
+        // First fragment seeds the expected count; later ones must agree.
+        if self.fragments.is_empty() {
+            self.count = split.count;
+        } else if self.count != split.count {
+            return Err(PingError::Protocol(format!(
+                "split count mismatch: expected {}, got {}",
+                self.count, split.count
+            )));
+        }
+        self.fragments.insert(split.index, body);
+        if self.fragments.len() == self.count as usize {
+            // All present — concatenate in index order and reset.
+            let mut assembled = Vec::new();
+            for (_idx, chunk) in std::mem::take(&mut self.fragments) {
+                assembled.extend_from_slice(&chunk);
+            }
+            self.count = 0;
+            Ok(Some(assembled))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Byte-level encode/decode tests for the RakNet connected wire format.
@@ -784,16 +1005,185 @@ mod tests {
     }
 
     #[test]
-    fn frame_decode_rejects_split_flag() {
-        // flags bit 4 set (split=1), rest minimal. 0x10 = reliability 0 with split.
-        // (len_bits field 0x0000 = 0 bytes body, but split is rejected first.)
-        let data = [0x10, 0x00, 0x00];
-        let mut p = PacketBuf::new(&data, "Split");
-        let err = Frame::decode(&mut p).unwrap_err();
-        assert!(
-            format!("{err}").contains("split"),
-            "unexpected error: {err}"
+    fn frame_split_encode_decode_round_trips() {
+        // A reliable-ordered frame split into 3 fragments, each with body [0xAB].
+        // Reliability 3 → flags high bits 0x60; split set → bit 4 → 0x70.
+        let body = vec![0xAB];
+        let split = SplitInfo { count: 3, id: 0x1234, index: 1 };
+        let f = Frame::new(Reliability::ReliableOrdered, body.clone())
+            .with_reliable_index(7)
+            .with_order(9, 0)
+            .with_split(split);
+        let bytes = f.encode().unwrap();
+        let mut p = PacketBuf::new(&bytes, "SplitFrame");
+        let decoded = Frame::decode(&mut p).unwrap().unwrap();
+        assert_eq!(decoded, f);
+        assert_eq!(p.remaining(), 0);
+    }
+
+    #[test]
+    fn frame_split_encode_exact_bytes_big_endian() {
+        // Prove the split fields are big-endian (unlike the LE index fields).
+        // Unreliable (flags 0x00) split frame: body [0x42] (1 byte → 0x08 bits).
+        // split_count=1 (BE: 00 00 00 01), split_id=0x0102 (BE: 01 02),
+        // split_index=0 (BE: 00 00 00 00).
+        let f = Frame::new(Reliability::Unreliable, vec![0x42])
+            .with_split(SplitInfo { count: 1, id: 0x0102, index: 0 });
+        assert_eq!(
+            f.encode().unwrap(),
+            [
+                0x10, // flags: unreliable(0) | split bit(0x10)
+                0x00, 0x08, // body_len_bits (1 << 3)
+                0x00, 0x00, 0x00, 0x01, // split_count BE
+                0x01, 0x02, // split_id BE
+                0x00, 0x00, 0x00, 0x00, // split_index BE
+                0x42, // body
+            ]
         );
+    }
+
+    #[test]
+    fn frame_decode_reads_split_fields() {
+        // Hand-build a split frame to prove the decoder reads BE split fields.
+        let data = [
+            0x10, // flags: unreliable | split
+            0x00, 0x08, // body_len_bits = 8 = 1 byte
+            0x00, 0x00, 0x00, 0x02, // split_count BE = 2
+            0x00, 0x05, // split_id BE = 5
+            0x00, 0x00, 0x00, 0x01, // split_index BE = 1
+            0x99, // body
+        ];
+        let mut p = PacketBuf::new(&data, "Split");
+        let f = Frame::decode(&mut p).unwrap().unwrap();
+        let s = f.split().expect("split metadata present");
+        assert_eq!(s.count, 2);
+        assert_eq!(s.id, 5);
+        assert_eq!(s.index, 1);
+        assert_eq!(f.body(), &[0x99]);
+    }
+
+    #[test]
+    fn frame_non_split_has_no_split_fields() {
+        // A plain unreliable frame: flags 0x00, no split bit, no split bytes.
+        let f = Frame::new(Reliability::Unreliable, vec![0x01]);
+        assert_eq!(f.encode().unwrap(), [0x00, 0x00, 0x08, 0x01]);
+        assert!(f.split().is_none());
+    }
+
+    #[test]
+    fn frame_split_into_fits_in_one_returns_single() {
+        // Body already fits → single non-split frame, no SplitInfo.
+        let template = Frame::new(Reliability::ReliableOrdered, vec![0x1, 0x2]);
+        let frags = Frame::split_into(&template, 100, 0).unwrap();
+        assert_eq!(frags.len(), 1);
+        assert!(frags[0].split().is_none());
+        assert_eq!(frags[0].body(), &[0x1, 0x2]);
+    }
+
+    #[test]
+    fn frame_split_into_chunks_evenly() {
+        // 10-byte body, max 4 bytes each → 3 fragments (4, 4, 2).
+        let body: Vec<u8> = (0..10u8).collect();
+        let template =
+            Frame::new(Reliability::ReliableOrdered, body.clone()).with_order(0, 0);
+        let frags = Frame::split_into(&template, 4, 0xAB).unwrap();
+        assert_eq!(frags.len(), 3);
+        for (i, f) in frags.iter().enumerate() {
+            let s = f.split().expect("fragment has split info");
+            assert_eq!(s.count, 3);
+            assert_eq!(s.id, 0xAB);
+            assert_eq!(s.index, i as u32);
+        }
+        // Bodies concatenate back to the original.
+        let mut reassembled = Vec::new();
+        for f in &frags {
+            reassembled.extend_from_slice(f.body());
+        }
+        assert_eq!(reassembled, body);
+    }
+
+    #[test]
+    fn frame_split_into_preserves_reliability_header() {
+        // The reliability/index fields are copied verbatim to every fragment.
+        let template = Frame::new(Reliability::ReliableOrdered, vec![0u8; 10])
+            .with_reliable_index(5)
+            .with_order(7, 2);
+        let frags = Frame::split_into(&template, 3, 1).unwrap();
+        for f in &frags {
+            assert_eq!(f.reliability(), Reliability::ReliableOrdered);
+            assert_eq!(f.reliable_index(), Some(5));
+            assert_eq!(f.order_index(), Some(7));
+            assert_eq!(f.order_channel(), 2);
+        }
+    }
+
+    #[test]
+    fn reassembler_collects_and_concatenates_in_index_order() {
+        // Fragments arriving out of order must reassemble in index order.
+        let mut r = Reassembler::new();
+        assert!(r
+            .add(SplitInfo { count: 3, id: 1, index: 2 }, vec![0x3])
+            .unwrap()
+            .is_none());
+        assert!(r
+            .add(SplitInfo { count: 3, id: 1, index: 0 }, vec![0x1])
+            .unwrap()
+            .is_none());
+        let assembled = r
+            .add(SplitInfo { count: 3, id: 1, index: 1 }, vec![0x2])
+            .unwrap()
+            .expect("complete after 3rd fragment");
+        assert_eq!(assembled, vec![0x1, 0x2, 0x3]); // index order, not arrival order
+    }
+
+    #[test]
+    fn reassembler_rejects_duplicate_index() {
+        let mut r = Reassembler::new();
+        r.add(SplitInfo { count: 2, id: 1, index: 0 }, vec![0x1]).unwrap();
+        assert!(r
+            .add(SplitInfo { count: 2, id: 1, index: 0 }, vec![0x9])
+            .is_err());
+    }
+
+    #[test]
+    fn reassembler_rejects_count_mismatch() {
+        let mut r = Reassembler::new();
+        r.add(SplitInfo { count: 3, id: 1, index: 0 }, vec![0x1]).unwrap();
+        assert!(r
+            .add(SplitInfo { count: 2, id: 1, index: 1 }, vec![0x2])
+            .is_err());
+    }
+
+    #[test]
+    fn reassembler_rejects_index_out_of_range() {
+        let mut r = Reassembler::new();
+        assert!(r
+            .add(SplitInfo { count: 2, id: 1, index: 5 }, vec![0x1])
+            .is_err());
+    }
+
+    #[test]
+    fn split_round_trip_through_wire() {
+        // Split a payload, encode each fragment, decode it, reassemble — the
+        // reassembled body must equal the original. End-to-end split path.
+        let original: Vec<u8> = (0..25u8).collect();
+        let template = Frame::new(Reliability::ReliableOrdered, original.clone())
+            .with_reliable_index(1)
+            .with_order(1, 0);
+        let frags = Frame::split_into(&template, 10, 0x55).unwrap();
+        assert_eq!(frags.len(), 3);
+
+        let mut r = Reassembler::new();
+        for f in frags {
+            let bytes = f.encode().unwrap();
+            let mut p = PacketBuf::new(&bytes, "WireSplit");
+            let decoded = Frame::decode(&mut p).unwrap().unwrap();
+            let split = decoded.split().expect("decoded fragment is split");
+            let done = r.add(split, decoded.body().to_vec()).unwrap();
+            if let Some(assembled) = done {
+                assert_eq!(assembled, original);
+            }
+        }
     }
 
     #[test]
