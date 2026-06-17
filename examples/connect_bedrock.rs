@@ -1,4 +1,5 @@
-//! Example: open a persistent RakNet session with a Bedrock server.
+//! Example: open a persistent RakNet session with a Bedrock server, then
+//! exercise the lowest-level send/receive methods.
 //!
 //! Run with:
 //! ```sh
@@ -15,20 +16,28 @@
 //! cargo run --example connect_bedrock -- geo.hivebedrock.network:19132
 //! ```
 //!
-//! This demonstrates the reqwest-style `Client::connect()` + `ConnectBuilder`
-//! usage: `client.connect()` seeds a builder with the client's GUID, and
-//! `.send(addr)` performs the full 4-packet RakNet handshake
-//! (Request 1 → Reply 1 → Request 2 → Reply 2), returning a live [`Connection`]
-//! that owns the open UDP socket plus the negotiated session parameters
-//! (`server_guid`, MTU, encryption flag).
+//! ## What it does
 //!
-//! > **Note**: after the handshake the UDP session is established, but the
-//! > datagram framing layer (`0x80`–`0x8D`) is not implemented yet, so no
-//! > application-layer packets can be sent through the returned `Connection`.
-//! > We therefore immediately print the session info and close it.
+//! 1. Performs the full 4-packet RakNet handshake
+//!    (Request 1 → Reply 1 → Request 2 → Reply 2) via the reqwest-style
+//!    `Client::connect()` + `ConnectBuilder` API, returning a live
+//!    [`Connection`] that owns the open UDP socket plus the negotiated
+//!    parameters (`server_guid`, MTU, encryption flag).
+//! 2. Sends one minimal datagram through [`Connection::send_datagram`] and
+//!    receives one packet through [`Connection::recv_raw`], to prove the
+//!    connected-layer wire format round-trips against a live server.
+//!
+//! > **Note**: `send_datagram` / `recv_raw` are the **lowest-level** methods.
+//! > No sequence numbers are auto-allocated, no ACK is sent for what we
+//! > receive, and nothing is retransmitted. The server will therefore treat
+//! > our datagram as unacknowledged and eventually time the session out — this
+//! > example sends a single datagram, receives a single packet, and exits, just
+//! > to demonstrate that the bytes we encode are accepted and that we can
+//! > decode the reply.
 
 use std::time::Duration;
 
+use mcget::bedrock::conn::{Datagram, Frame, Incoming, Reliability};
 use mcget::bedrock::Client;
 use mcget::PingError;
 
@@ -76,6 +85,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Print the basic connection facts negotiated during the handshake.
     print_connection(&conn);
 
+    // Send a minimal datagram to exercise the lowest-level send path.
+    send_and_receive(&conn).await?;
+
     // Close the session. This drops the socket; the server will detect the loss
     // via its own keep-alive timeout (no graceful 0x13 Disconnect is sent yet).
     conn.close().await?;
@@ -84,6 +96,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Prints the negotiated session parameters.
 fn print_connection(conn: &mcget::bedrock::conn::Connection) {
     println!("  Peer address : {}", conn.peer());
     println!("  Server GUID  : {}", conn.server_guid());
@@ -97,4 +110,76 @@ fn print_connection(conn: &mcget::bedrock::conn::Connection) {
             "off"
         }
     );
+}
+
+/// Sends one datagram and receives one packet, proving the connected-layer
+/// wire format round-trips against the live server.
+async fn send_and_receive(
+    conn: &mcget::bedrock::conn::Connection,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Build a minimal datagram: sequence number 0, one Unreliable frame whose
+    // body is a placeholder. (A real RakNet client would send a Connected Ping
+    // here; the system-message codec is a follow-up, so we just send a tiny
+    // Unreliable frame to prove the wire format is accepted by the server.)
+    let frame = Frame::new(Reliability::Unreliable, vec![0x00, 0x01, 0x02, 0x03]);
+    let datagram = Datagram::new(0, vec![frame])?;
+
+    println!("\n  >> sending datagram (seq=0, 1 unreliable frame)...");
+    conn.send_datagram(&datagram).await.map_err(|e| {
+        println!("  send FAILED: {e}");
+        Box::<dyn std::error::Error>::from(e)
+    })?;
+    println!("  >> sent ok");
+
+    // Receive a single packet. We expect either an ACK of our datagram or a
+    // datagram from the server. Timeout after 5 s — the library's recv_raw does
+    // not time out on its own (crate convention).
+    println!("\n  << waiting for a packet (5s timeout)...");
+    match tokio::time::timeout(Duration::from_secs(5), conn.recv_raw()).await {
+        Ok(Ok(incoming)) => print_incoming(&incoming),
+        Ok(Err(e)) => {
+            println!("  recv FAILED: {e}");
+            return Err(e.into());
+        }
+        Err(_) => println!("  << timed out waiting for a packet"),
+    }
+    Ok(())
+}
+
+/// Prints the decoded incoming packet (datagram / ACK / NACK).
+fn print_incoming(incoming: &Incoming) {
+    match incoming {
+        Incoming::Datagram(dg) => {
+            println!(
+                "  << Datagram: seq={} frames={}",
+                dg.sequence_number(),
+                dg.frames().len()
+            );
+            for (i, frame) in dg.frames().iter().enumerate() {
+                println!(
+                    "     frame {i}: reliability={:?} body_len={}",
+                    frame.reliability(),
+                    frame.body().len()
+                );
+            }
+        }
+        Incoming::Ack(ack) => {
+            println!("  << ACK: {} range(s)", ack.ranges().len());
+            for r in ack.ranges() {
+                match r.end() {
+                    None => println!("     single seq {}", r.start()),
+                    Some(end) => println!("     range {}..={}", r.start(), end),
+                }
+            }
+        }
+        Incoming::Nack(nack) => {
+            println!("  << NACK: {} range(s)", nack.ranges().len());
+            for r in nack.ranges() {
+                match r.end() {
+                    None => println!("     single seq {}", r.start()),
+                    Some(end) => println!("     range {}..={}", r.start(), end),
+                }
+            }
+        }
+    }
 }

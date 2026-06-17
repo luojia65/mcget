@@ -56,6 +56,12 @@ use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
 
+// Re-export the connected-layer wire-format types so callers can build
+// datagrams and inspect incoming packets through the
+// `mcget::bedrock::conn::{Datagram, Frame, Reliability, Incoming}` path. The
+// `send_datagram` / `recv_raw` methods below refer to these in their signatures.
+pub use super::datagram::{Datagram, Frame, Incoming, Reliability};
+
 // ==================== Packet IDs ====================
 
 /// Open Connection Request 1.
@@ -195,10 +201,9 @@ impl HandshakeRejection {
 /// # }
 /// ```
 pub struct Connection {
-    // Held open for the lifetime of the session. Not read until the datagram
-    // layer (frame encapsulation, ACK/NACK) lands in a later iteration; until
-    // then `close()` consumes it to release the socket.
-    #[allow(dead_code)]
+    // Held open for the lifetime of the session. Exposed (read/write) via the
+    // `send_datagram` / `recv_raw` methods; tokio's UdpSocket accepts `&self`
+    // for both, so no interior mutability is needed.
     socket: UdpSocket,
     server_addr: SocketAddr,
     server_guid: i64,
@@ -255,6 +260,98 @@ impl Connection {
     /// The server's resolved socket address.
     pub fn peer(&self) -> SocketAddr {
         self.server_addr
+    }
+
+    /// Sends a fully-constructed [`Datagram`] to the server over the open socket.
+    ///
+    /// This is the **lowest-level send**: the caller is responsible for setting
+    /// the datagram's sequence number and the reliability/index fields of every
+    /// [`Frame`] it carries. No sequence-number allocation, no ACK tracking, no
+    /// retransmission is performed here — those live in a future reliability
+    /// layer built on top of this primitive.
+    ///
+    /// The encoded datagram is checked against the negotiated [`MTU`](Self::mtu):
+    /// a datagram larger than the MTU would be fragmented by the IP layer, which
+    /// RakNet forbids, so it is rejected with [`PingError::Protocol`].
+    ///
+    /// # Examples
+    ///
+    /// Send a single unreliable frame carrying arbitrary bytes (no reliability
+    /// guarantees — the server may or may not act on it):
+    ///
+    /// ```no_run
+    /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    /// use mcget::bedrock::conn::{Connection, Datagram, Frame, Reliability};
+    /// let conn = Connection::connect("play.x.net").await?;
+    /// let dg = Datagram::new(0, vec![Frame::new(Reliability::Unreliable, vec![0x42])])?;
+    /// conn.send_datagram(&dg).await?;
+    /// conn.close().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PingError::Protocol`] if the encoded datagram exceeds the MTU,
+    /// or if frame encoding itself fails (e.g. a reliability/index mismatch).
+    /// Returns [`PingError::Io`] on socket send failure.
+    pub async fn send_datagram(&self, datagram: &Datagram) -> Result<()> {
+        let buf = datagram.encode()?;
+        if buf.len() > self.mtu as usize {
+            return Err(PingError::Protocol(format!(
+                "datagram is {} bytes which exceeds the negotiated MTU of {}",
+                buf.len(),
+                self.mtu
+            )));
+        }
+        self.socket.send(&buf).await?;
+        Ok(())
+    }
+
+    /// Receives one UDP datagram from the server and decodes it via
+    /// [`datagram::classify`](super::datagram::classify) into a datagram, ACK,
+    /// or NACK.
+    ///
+    /// This is the **lowest-level receive**: it returns the raw classification
+    /// result so the caller can dispatch (`Incoming::Datagram` carries
+    /// application/system frames; `Incoming::Ack` / `Incoming::Nack` carry
+    /// sequence-number ranges a reliability layer would act on). No ACK is sent
+    /// automatically — without one, the peer will eventually retransmit or time
+    /// the session out.
+    ///
+    /// This method does **not** time out on its own; wrap it with
+    /// `tokio::time::timeout` to bound the wait (matching the crate convention
+    /// of no built-in timeouts).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    /// use std::time::Duration;
+    /// use mcget::bedrock::conn::{Connection, Incoming};
+    /// let conn = Connection::connect("play.x.net").await?;
+    /// match tokio::time::timeout(Duration::from_secs(5), conn.recv_raw()).await {
+    ///     Ok(Ok(incoming)) => println!("received: {incoming:?}"),
+    ///     Ok(Err(e)) => return Err(e.into()),
+    ///     Err(_) => println!("timed out waiting for a packet"),
+    /// }
+    /// conn.close().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PingError::Io`] on socket receive failure, or
+    /// [`PingError::Protocol`] if the received bytes are not a valid datagram /
+    /// ACK / NACK (e.g. a truncated or unknown packet).
+    pub async fn recv_raw(&self) -> Result<Incoming> {
+        // Size the receive buffer to just past the MTU so a well-formed datagram
+        // always fits, while a too-large packet (which shouldn't happen on a
+        // healthy link) is still caught rather than silently truncated.
+        let mut buf = vec![0u8; self.mtu as usize + 1];
+        let n = self.socket.recv(&mut buf).await?;
+        super::datagram::classify(&buf[..n])
     }
 
     /// Closes the session by dropping the socket.

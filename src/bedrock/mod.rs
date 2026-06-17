@@ -25,8 +25,10 @@ pub mod conn;
 pub mod ping;
 // Wire-format primitives (magic / PacketBuf / IPv4 system-address codec). Internal.
 mod raknet;
-// Connected-layer wire format: datagrams, frames, ACK/NACK. Internal.
-mod datagram;
+// Connected-layer wire format: datagrams, frames, ACK/NACK.
+// Public so `Connection::send_datagram` / `recv_raw` callers can build
+// datagrams and inspect incoming packets.
+pub mod datagram;
 
 pub use ping::{ping as ping_bedrock_inner, Client, PongResponse, RequestBuilder};
 // MAGIC is defined in `raknet` and surfaced here so the public path

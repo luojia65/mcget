@@ -15,12 +15,12 @@
 //! Datagram:  flag(0x80–0x8D) | seq(u24 LE) | frame | frame | ...
 //!
 //! Frame:     flags(u8: reliability<<5 | split<<4)
-//!            | body_length(u16 BE)
+//!            | body_length_bits(u16 BE)   -- size in BITS, divide by 8 for bytes
 //!            | [reliable_index(u24 LE)]   if reliable
 //!            | [sequence_index (u24 LE)]  if sequenced
 //!            | [order_index    (u24 LE)]  if ordered
 //!            | [order_channel  (u8)]      if ordered
-//!            | body(body_length bytes)
+//!            | body(body_length_bits / 8 bytes)
 //!
 //! ACK/NACK:  flag(0xC0 ACK | 0xA0 NACK)
 //!            | record_count(u16 BE)
@@ -94,7 +94,7 @@ const U24_MAX: u32 = 0x00ff_ffff;
 /// unsupported on decode; if needed later they can be added without breaking
 /// the existing wire format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Reliability {
+pub enum Reliability {
     /// 0 — fire and forget; no index fields on the wire.
     Unreliable,
     /// 1 — drop-if-stale; sequenced + ordered index fields.
@@ -169,7 +169,7 @@ impl Reliability {
 /// [`Reliability`] calls for them; the encoder emits/omits them accordingly,
 /// so a freshly-decoded frame round-trips byte-for-byte.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Frame {
+pub struct Frame {
     reliability: Reliability,
     /// Per-frame index of reliable messages (`Some` only when reliable).
     reliable_index: Option<u32>,
@@ -186,9 +186,10 @@ pub(crate) struct Frame {
 }
 
 impl Frame {
-    /// Creates an unreliable frame carrying `body`. Convenience for the common
-    /// "just send some bytes" case; other index fields default to `None`.
-    pub(crate) fn new(reliability: Reliability, body: Vec<u8>) -> Self {
+    /// Creates a frame with the given reliability carrying `body`. Index fields
+    /// default to `None`; set the ones the reliability calls for with the
+    /// `with_*` builders (an unreliable frame needs none of them).
+    pub fn new(reliability: Reliability, body: Vec<u8>) -> Self {
         Self {
             reliability,
             reliable_index: None,
@@ -200,17 +201,17 @@ impl Frame {
     }
 
     /// Sets the reliable index. Must be `<= 0x00FF_FFFF`.
-    pub(crate) fn with_reliable_index(mut self, idx: u32) -> Self {
+    pub fn with_reliable_index(mut self, idx: u32) -> Self {
         self.reliable_index = Some(idx);
         self
     }
     /// Sets the sequenced index.
-    pub(crate) fn with_sequence_index(mut self, idx: u32) -> Self {
+    pub fn with_sequence_index(mut self, idx: u32) -> Self {
         self.sequence_index = Some(idx);
         self
     }
     /// Sets the order index and channel.
-    pub(crate) fn with_order(mut self, idx: u32, channel: u8) -> Self {
+    pub fn with_order(mut self, idx: u32, channel: u8) -> Self {
         self.order_index = Some(idx);
         self.order_channel = channel;
         self
@@ -218,9 +219,10 @@ impl Frame {
 
     /// Encodes this frame into a freshly-allocated byte buffer.
     ///
-    /// Layout: `flags | body_length(u16 BE) | [reliable_index] | [sequence_index]
-    /// | [order_index] | [order_channel] | body`. The split flag is always 0
-    /// (splitting is not supported).
+    /// Layout: `flags | body_length_bits(u16 BE) | [reliable_index] |
+    /// [sequence_index] | [order_index] | [order_channel] | body`. The length
+    /// field carries the body size **in bits** (per RakNet's wire format), and
+    /// the split flag is always 0 (splitting is not supported).
     pub(crate) fn encode(&self) -> Result<Vec<u8>> {
         // Validate the index values fit in 24 bits and are consistent with the
         // reliability (a wrong combination would produce a malformed frame that
@@ -269,17 +271,25 @@ impl Frame {
             }
         }
 
-        let body_len = u16::try_from(self.body.len())
-            .map_err(|_| PingError::Protocol(format!("frame body too large: {} bytes", self.body.len())))?;
-        // A body longer than 65535 can't be carried (length field is u16), and
-        // fragments would be required above the MTU — but we don't fragment.
-        // Keep the bound explicit so callers get a clear error rather than a
-        // silent truncation.
+        // The on-wire "length" field is the body size **in bits** (BE u16), not
+        // bytes — see go-raknet `packet.go` (`uint16(len(content))<<3` on write,
+        // `Uint16(...) >> 3` on read). So the body must fit in 65535 bits
+        // (~8 KiB), well within any MTU; the bound below catches overflow.
+        let body_bits = (self.body.len() as u32)
+            .checked_mul(8)
+            .and_then(|b| u16::try_from(b).ok())
+            .ok_or_else(|| {
+                PingError::Protocol(format!(
+                    "frame body too large to encode: {} bytes ({} bits > 65535)",
+                    self.body.len(),
+                    self.body.len() as u32 * 8
+                ))
+            })?;
 
         let mut buf = Vec::with_capacity(3 + self.body.len() + 10);
         // Flags byte: reliability in the top 3 bits, split bit (4) always 0.
         buf.push((self.reliability.as_raw() << 5) | (0 << FRAME_SPLIT_BIT));
-        buf.extend_from_slice(&body_len.to_be_bytes());
+        buf.extend_from_slice(&body_bits.to_be_bytes());
         if let Some(idx) = self.reliable_index {
             buf.extend_from_slice(&write_u24_le(idx));
         }
@@ -311,7 +321,17 @@ impl Frame {
             ));
         }
 
-        let body_len = buf.read_u16()? as usize;
+        // The length field is the body size in bits (BE u16) — convert to bytes
+        // with `>> 3`. It must be a whole number of bytes; a non-multiple-of-8
+        // value would indicate a malformed frame (the encoder always writes
+        // `len_bytes << 3`).
+        let body_len_bits = buf.read_u16()?;
+        if body_len_bits & 0b111 != 0 {
+            return Err(PingError::Protocol(format!(
+                "frame body length {body_len_bits} is not a whole number of bytes"
+            )));
+        }
+        let body_len = (body_len_bits >> 3) as usize;
         let reliable_index = if reliability.is_reliable() {
             Some(buf.read_u24_le()?)
         } else {
@@ -340,28 +360,28 @@ impl Frame {
     }
 
     /// Read-only accessors used by tests (and, later, the receive layer).
-    #[cfg(test)]
-    pub(crate) fn reliability(&self) -> Reliability {
+    /// The delivery guarantee this frame was sent with.
+    pub fn reliability(&self) -> Reliability {
         self.reliability
     }
-    #[cfg(test)]
-    pub(crate) fn reliable_index(&self) -> Option<u32> {
+    /// The reliable index (`Some` only for reliable frames).
+    pub fn reliable_index(&self) -> Option<u32> {
         self.reliable_index
     }
-    #[cfg(test)]
-    pub(crate) fn sequence_index(&self) -> Option<u32> {
+    /// The sequenced index (`Some` only for sequenced frames).
+    pub fn sequence_index(&self) -> Option<u32> {
         self.sequence_index
     }
-    #[cfg(test)]
-    pub(crate) fn order_index(&self) -> Option<u32> {
+    /// The order index (`Some` only for ordered frames).
+    pub fn order_index(&self) -> Option<u32> {
         self.order_index
     }
-    #[cfg(test)]
-    pub(crate) fn order_channel(&self) -> u8 {
+    /// The ordering channel (meaningful only for ordered frames).
+    pub fn order_channel(&self) -> u8 {
         self.order_channel
     }
-    #[cfg(test)]
-    pub(crate) fn body(&self) -> &[u8] {
+    /// The encapsulated payload (application bytes or a RakNet system message).
+    pub fn body(&self) -> &[u8] {
         &self.body
     }
 }
@@ -371,7 +391,7 @@ impl Frame {
 /// A Frame Set Packet: the connected-mode envelope carrying zero or more
 /// [`Frame`]s, identified by a 24-bit sequence number the receiver acknowledges.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Datagram {
+pub struct Datagram {
     sequence_number: u32,
     frames: Vec<Frame>,
 }
@@ -379,7 +399,7 @@ pub(crate) struct Datagram {
 impl Datagram {
     /// Creates a datagram with the given sequence number and frames. The
     /// sequence number must fit in 24 bits (`<= 0x00FF_FFFF`).
-    pub(crate) fn new(sequence_number: u32, frames: Vec<Frame>) -> Result<Self> {
+    pub fn new(sequence_number: u32, frames: Vec<Frame>) -> Result<Self> {
         if sequence_number > U24_MAX {
             return Err(PingError::Protocol(format!(
                 "datagram sequence number {sequence_number:#x} exceeds 24-bit maximum {U24_MAX:#x}"
@@ -392,12 +412,12 @@ impl Datagram {
     }
 
     /// Sequence number used for ACK/NACK tracking (24-bit, little-endian on wire).
-    pub(crate) fn sequence_number(&self) -> u32 {
+    pub fn sequence_number(&self) -> u32 {
         self.sequence_number
     }
 
     /// The frames this datagram carries, in wire order.
-    pub(crate) fn frames(&self) -> &[Frame] {
+    pub fn frames(&self) -> &[Frame] {
         &self.frames
     }
 
@@ -450,7 +470,7 @@ impl Datagram {
 /// One entry in an ACK/NACK range list: either a single sequence number or a
 /// `[start, end]` inclusive range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct AckRange {
+pub struct AckRange {
     start: u32,
     /// `None` = a single sequence number; `Some(end)` = an inclusive range.
     end: Option<u32>,
@@ -458,18 +478,24 @@ pub(crate) struct AckRange {
 
 impl AckRange {
     /// A single sequence number.
-    pub(crate) fn single(seq: u32) -> Self {
-        Self { start: seq, end: None }
+    pub fn single(seq: u32) -> Self {
+        Self {
+            start: seq,
+            end: None,
+        }
     }
     /// An inclusive `[start, end]` range.
-    pub(crate) fn range(start: u32, end: u32) -> Self {
-        Self { start, end: Some(end) }
+    pub fn range(start: u32, end: u32) -> Self {
+        Self {
+            start,
+            end: Some(end),
+        }
     }
 
-    pub(crate) fn start(&self) -> u32 {
+    pub fn start(&self) -> u32 {
         self.start
     }
-    pub(crate) fn end(&self) -> Option<u32> {
+    pub fn end(&self) -> Option<u32> {
         self.end
     }
 }
@@ -477,7 +503,7 @@ impl AckRange {
 /// An ACK (`0xC0`) or NACK (`0xA0`) packet: a list of datagram sequence-number
 /// ranges being acknowledged or requested for retransmission.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Acknowledgement {
+pub struct Acknowledgement {
     is_ack: bool,
     ranges: Vec<AckRange>,
 }
@@ -485,16 +511,16 @@ pub(crate) struct Acknowledgement {
 impl Acknowledgement {
     /// Creates an ACK (`is_ack = true`) or NACK (`is_ack = false`) with the
     /// given range list.
-    pub(crate) fn new(is_ack: bool, ranges: Vec<AckRange>) -> Self {
+    pub fn new(is_ack: bool, ranges: Vec<AckRange>) -> Self {
         Self { is_ack, ranges }
     }
 
     /// `true` for ACK, `false` for NACK.
-    pub(crate) fn is_ack(&self) -> bool {
+    pub fn is_ack(&self) -> bool {
         self.is_ack
     }
 
-    pub(crate) fn ranges(&self) -> &[AckRange] {
+    pub fn ranges(&self) -> &[AckRange] {
         &self.ranges
     }
 
@@ -565,7 +591,7 @@ impl Acknowledgement {
 /// one byte to route to the right parser, without requiring the caller to know
 /// the flag layout.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Incoming {
+pub enum Incoming {
     /// A Frame Set Packet carrying application/system frames.
     Datagram(Datagram),
     /// An acknowledgement of received datagrams (`0xC0`).
@@ -583,7 +609,7 @@ pub(crate) enum Incoming {
 /// ACK (`0xC0`) from the rest; bit 5 distinguishes NACK (`0xA0`) from a
 /// datagram (`0x80`) within the bit-6-clear group. Matching on the full flag
 /// (not just the masked top bits) is what separates NACK from datagram.
-pub(crate) fn classify(data: &[u8]) -> Result<Incoming> {
+pub fn classify(data: &[u8]) -> Result<Incoming> {
     let first = *data.first().ok_or_else(|| {
         PingError::Protocol("empty packet: cannot classify a 0-byte datagram".to_string())
     })?;
@@ -678,7 +704,10 @@ mod tests {
         assert!(Reliability::from_raw(4).is_ok());
         // Variants 5–7 (with ack receipt) are unsupported.
         for raw in 5..=7u8 {
-            assert!(Reliability::from_raw(raw).is_err(), "raw {raw} should be rejected");
+            assert!(
+                Reliability::from_raw(raw).is_err(),
+                "raw {raw} should be rejected"
+            );
         }
         // Anything >= 8 can't fit in 3 bits, but defend anyway.
         assert!(Reliability::from_raw(8).is_err());
@@ -701,25 +730,24 @@ mod tests {
 
     #[test]
     fn frame_unreliable_encode_exact_bytes() {
-        // flags(0x00) | body_len(BE: 0x00 0x03) | body(0xaa 0xbb 0xcc).
+        // flags(0x00) | body_len_bits(BE: 3<<3 = 0x0018) | body(0xaa 0xbb 0xcc).
         let f = Frame::new(Reliability::Unreliable, vec![0xaa, 0xbb, 0xcc]);
-        assert_eq!(f.encode().unwrap(), [0x00, 0x00, 0x03, 0xaa, 0xbb, 0xcc]);
+        assert_eq!(f.encode().unwrap(), [0x00, 0x00, 0x18, 0xaa, 0xbb, 0xcc]);
     }
 
     #[test]
     fn frame_reliable_encode_exact_bytes() {
-        // flags(0x40 = 2<<5) | len(BE 0x00 0x02) | reliable_index(LE 0x05 0x00 0x00) | body.
-        let f = Frame::new(Reliability::Reliable, vec![0xde, 0xad])
-            .with_reliable_index(5);
+        // flags(0x40 = 2<<5) | len_bits(BE 2<<3=0x10) | reliable_index(LE 0x05 0x00 0x00) | body.
+        let f = Frame::new(Reliability::Reliable, vec![0xde, 0xad]).with_reliable_index(5);
         assert_eq!(
             f.encode().unwrap(),
-            [0x40, 0x00, 0x02, 0x05, 0x00, 0x00, 0xde, 0xad]
+            [0x40, 0x00, 0x10, 0x05, 0x00, 0x00, 0xde, 0xad]
         );
     }
 
     #[test]
     fn frame_reliable_ordered_encode_exact_bytes() {
-        // flags(0x60 = 3<<5) | len(BE) | reliable_idx(LE) | order_idx(LE) | channel | body.
+        // flags(0x60 = 3<<5) | len_bits(BE) | reliable_idx(LE) | order_idx(LE) | channel | body.
         let f = Frame::new(Reliability::ReliableOrdered, vec![0x01])
             .with_reliable_index(0x010203)
             .with_order(0x0a, 2);
@@ -727,7 +755,7 @@ mod tests {
             f.encode().unwrap(),
             [
                 0x60, // reliability 3 << 5
-                0x00, 0x01, // body_len BE
+                0x00, 0x08, // body_len_bits BE (1 << 3 = 8)
                 0x03, 0x02, 0x01, // reliable_index LE (0x010203)
                 0x0a, 0x00, 0x00, // order_index LE
                 0x02, // order_channel
@@ -738,7 +766,7 @@ mod tests {
 
     #[test]
     fn frame_reliable_sequenced_encode_exact_bytes() {
-        // flags(0x80 = 4<<5) | len(BE) | reliable | sequenced | order+channel | body.
+        // flags(0x80 = 4<<5) | len_bits(BE) | reliable | sequenced | order+channel | body.
         let f = Frame::new(Reliability::ReliableSequenced, vec![0xff])
             .with_reliable_index(1)
             .with_sequence_index(2)
@@ -746,7 +774,7 @@ mod tests {
         assert_eq!(
             f.encode().unwrap(),
             [
-                0x80, 0x00, 0x01, // flags + len
+                0x80, 0x00, 0x08, // flags + len_bits (1 << 3 = 8)
                 0x01, 0x00, 0x00, // reliable
                 0x02, 0x00, 0x00, // sequenced
                 0x03, 0x00, 0x00, 0x01, // order + channel
@@ -758,10 +786,34 @@ mod tests {
     #[test]
     fn frame_decode_rejects_split_flag() {
         // flags bit 4 set (split=1), rest minimal. 0x10 = reliability 0 with split.
+        // (len_bits field 0x0000 = 0 bytes body, but split is rejected first.)
         let data = [0x10, 0x00, 0x00];
         let mut p = PacketBuf::new(&data, "Split");
         let err = Frame::decode(&mut p).unwrap_err();
-        assert!(format!("{err}").contains("split"), "unexpected error: {err}");
+        assert!(
+            format!("{err}").contains("split"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn frame_decode_reads_body_length_in_bits() {
+        // Hand-build a frame whose length field is in BITS to prove the decoder
+        // converts correctly (an endianness/units bug round-trips but fails
+        // against a real server's bytes). Body = [0xaa, 0xbb] → len_bits = 0x0010.
+        let data = [0x00, 0x00, 0x10, 0xaa, 0xbb];
+        let mut p = PacketBuf::new(&data, "BitsLen");
+        let f = Frame::decode(&mut p).unwrap().unwrap();
+        assert_eq!(f.body(), &[0xaa, 0xbb]);
+        assert_eq!(p.remaining(), 0);
+    }
+
+    #[test]
+    fn frame_decode_rejects_non_byte_aligned_length() {
+        // len_bits = 0x0009 (9 bits) — not a whole number of bytes.
+        let data = [0x00, 0x00, 0x09, 0xaa];
+        let mut p = PacketBuf::new(&data, "BadLen");
+        assert!(Frame::decode(&mut p).is_err());
     }
 
     #[test]
@@ -771,8 +823,7 @@ mod tests {
             Frame::new(Reliability::UnreliableSequenced, vec![0x1, 0x2])
                 .with_sequence_index(7)
                 .with_order(8, 0),
-            Frame::new(Reliability::Reliable, vec![0x0])
-                .with_reliable_index(0xff_ffff),
+            Frame::new(Reliability::Reliable, vec![0x0]).with_reliable_index(0xff_ffff),
             Frame::new(Reliability::ReliableOrdered, vec![0xa, 0xb, 0xc])
                 .with_reliable_index(10)
                 .with_order(11, 1),
@@ -784,7 +835,9 @@ mod tests {
         for original in cases {
             let bytes = original.encode().unwrap();
             let mut p = PacketBuf::new(&bytes, "RoundTrip");
-            let decoded = Frame::decode(&mut p).unwrap().expect("a frame should decode");
+            let decoded = Frame::decode(&mut p)
+                .unwrap()
+                .expect("a frame should decode");
             assert_eq!(decoded, original, "frame round-trip mismatch");
             assert_eq!(p.remaining(), 0, "no trailing bytes after frame");
         }
@@ -802,8 +855,7 @@ mod tests {
 
     #[test]
     fn frame_encode_rejects_oversized_index() {
-        let f = Frame::new(Reliability::Reliable, vec![0x0])
-            .with_reliable_index(0x01_00_00_00); // > 24-bit max
+        let f = Frame::new(Reliability::Reliable, vec![0x0]).with_reliable_index(0x01_00_00_00); // > 24-bit max
         assert!(f.encode().is_err());
     }
 
@@ -815,8 +867,8 @@ mod tests {
 
     #[test]
     fn frame_decode_truncated_body_is_error() {
-        // Declare body_len=5 but only 1 body byte present.
-        let data = [0x00, 0x00, 0x05, 0xaa];
+        // Declare body_len_bits=0x0010 (2 bytes) but only 1 body byte present.
+        let data = [0x00, 0x00, 0x10, 0xaa];
         let mut p = PacketBuf::new(&data, "Trunc");
         assert!(Frame::decode(&mut p).is_err());
     }
@@ -834,8 +886,11 @@ mod tests {
     fn datagram_encode_exact_bytes_with_one_frame() {
         let frame = Frame::new(Reliability::Unreliable, vec![0x42]);
         let d = Datagram::new(0, vec![frame]).unwrap();
-        // 0x80 | seq(0,0,0) | frame(0x00 | len BE 0x00 0x01 | 0x42).
-        assert_eq!(d.encode().unwrap(), [0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x42]);
+        // 0x80 | seq(0,0,0) | frame(flags 0x00 | len_bits BE 1<<3=0x08 | 0x42).
+        assert_eq!(
+            d.encode().unwrap(),
+            [0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x42]
+        );
     }
 
     #[test]
@@ -857,14 +912,17 @@ mod tests {
 
     #[test]
     fn datagram_decode_returns_none_for_ack() {
-        let ack = Acknowledgement::new(true, vec![AckRange::single(0)]).encode().unwrap();
+        let ack = Acknowledgement::new(true, vec![AckRange::single(0)])
+            .encode()
+            .unwrap();
         assert!(Datagram::decode(&ack).unwrap().is_none());
     }
 
     #[test]
     fn datagram_decode_returns_none_for_nack() {
-        let nack =
-            Acknowledgement::new(false, vec![AckRange::single(0)]).encode().unwrap();
+        let nack = Acknowledgement::new(false, vec![AckRange::single(0)])
+            .encode()
+            .unwrap();
         assert!(Datagram::decode(&nack).unwrap().is_none());
     }
 
@@ -893,25 +951,41 @@ mod tests {
         assert_eq!(
             ack.encode().unwrap(),
             [
-                0xc0, 0x00, 0x02,
-                ACK_RECORD_SINGLE, 0x03, 0x02, 0x01,
-                ACK_RECORD_SINGLE, 0x00, 0x00, 0x00,
+                0xc0,
+                0x00,
+                0x02,
+                ACK_RECORD_SINGLE,
+                0x03,
+                0x02,
+                0x01,
+                ACK_RECORD_SINGLE,
+                0x00,
+                0x00,
+                0x00,
             ]
         );
     }
 
     #[test]
     fn nack_encode_exact_bytes_mixed_ranges() {
-        let nack = Acknowledgement::new(
-            false,
-            vec![AckRange::single(5), AckRange::range(10, 12)],
-        );
+        let nack = Acknowledgement::new(false, vec![AckRange::single(5), AckRange::range(10, 12)]);
         assert_eq!(
             nack.encode().unwrap(),
             [
-                0xa0, 0x00, 0x02,
-                ACK_RECORD_SINGLE, 0x05, 0x00, 0x00,
-                ACK_RECORD_RANGE, 0x0a, 0x00, 0x00, 0x0c, 0x00, 0x00,
+                0xa0,
+                0x00,
+                0x02,
+                ACK_RECORD_SINGLE,
+                0x05,
+                0x00,
+                0x00,
+                ACK_RECORD_RANGE,
+                0x0a,
+                0x00,
+                0x00,
+                0x0c,
+                0x00,
+                0x00,
             ]
         );
     }
@@ -923,7 +997,11 @@ mod tests {
             Acknowledgement::new(true, vec![AckRange::single(0xff_ffff)]),
             Acknowledgement::new(
                 false,
-                vec![AckRange::range(0, 9), AckRange::single(100), AckRange::range(200, 299)],
+                vec![
+                    AckRange::range(0, 9),
+                    AckRange::single(100),
+                    AckRange::range(200, 299),
+                ],
             ),
         ];
         for original in cases {
@@ -970,10 +1048,14 @@ mod tests {
 
     #[test]
     fn classify_routes_ack_and_nack() {
-        let ack = Acknowledgement::new(true, vec![AckRange::single(0)]).encode().unwrap();
+        let ack = Acknowledgement::new(true, vec![AckRange::single(0)])
+            .encode()
+            .unwrap();
         assert!(matches!(classify(&ack).unwrap(), Incoming::Ack(_)));
 
-        let nack = Acknowledgement::new(false, vec![AckRange::single(0)]).encode().unwrap();
+        let nack = Acknowledgement::new(false, vec![AckRange::single(0)])
+            .encode()
+            .unwrap();
         assert!(matches!(classify(&nack).unwrap(), Incoming::Nack(_)));
     }
 
