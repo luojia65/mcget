@@ -33,7 +33,7 @@
 // "never used" warnings at the module level.
 #![allow(dead_code)]
 
-use super::datagram::{Acknowledgement, AckRange, Datagram, Frame, Reassembler, Reliability};
+use super::datagram::{AckRange, Acknowledgement, Datagram, Frame, Reassembler, Reliability};
 use crate::error::Result;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
@@ -308,7 +308,11 @@ impl ReliabilityEngine {
     /// it carried — *in the order they should be delivered*. Ordered frames may
     /// be buffered until their predecessors arrive; unordered/unreliable frames
     /// are returned immediately.
-    pub(crate) fn on_datagram_received(&mut self, dg: &Datagram, now: Instant) -> Result<Vec<Frame>> {
+    pub(crate) fn on_datagram_received(
+        &mut self,
+        dg: &Datagram,
+        now: Instant,
+    ) -> Result<Vec<Frame>> {
         self.last_recv = now;
         let seq = dg.sequence_number() & SEQ_MASK;
         let is_new = self.recv_window.record(seq);
@@ -619,7 +623,10 @@ mod tests {
         );
         assert!(eng.unacked.is_empty(), "ACK should clear the unacked entry");
         // RTT should have moved toward 100 ms (from the 200 ms initial).
-        assert!(eng.rtt() < INITIAL_RTT, "RTT should decrease after a fast sample");
+        assert!(
+            eng.rtt() < INITIAL_RTT,
+            "RTT should decrease after a fast sample"
+        );
     }
 
     // ---------- NACK / retransmission ----------
@@ -748,18 +755,29 @@ mod tests {
         let f0 = Frame::new(Reliability::ReliableOrdered, vec![0x1, 0x2])
             .with_reliable_index(0)
             .with_order(0, 0)
-            .with_split(SplitInfo { count: 2, id: 1, index: 0 });
+            .with_split(SplitInfo {
+                count: 2,
+                id: 1,
+                index: 0,
+            });
         let f1 = Frame::new(Reliability::ReliableOrdered, vec![0x3, 0x4])
             .with_reliable_index(0)
             .with_order(0, 0)
-            .with_split(SplitInfo { count: 2, id: 1, index: 1 });
+            .with_split(SplitInfo {
+                count: 2,
+                id: 1,
+                index: 1,
+            });
         let dg = Datagram::new(0, vec![f0, f1]).unwrap();
         eng.on_datagram_received(&dg, t0()).unwrap();
         let drained = eng.drain_ordered();
         assert_eq!(drained.len(), 1);
         // Reassembled body = concatenation in index order.
         assert_eq!(drained[0].body(), &[0x1, 0x2, 0x3, 0x4]);
-        assert!(drained[0].split().is_none(), "reassembled frame is not split");
+        assert!(
+            drained[0].split().is_none(),
+            "reassembled frame is not split"
+        );
     }
 
     #[test]
@@ -768,15 +786,26 @@ mod tests {
         // First fragment only.
         let f0 = Frame::new(Reliability::ReliableOrdered, vec![0x1])
             .with_order(0, 0)
-            .with_split(SplitInfo { count: 2, id: 1, index: 0 });
+            .with_split(SplitInfo {
+                count: 2,
+                id: 1,
+                index: 0,
+            });
         let dg0 = Datagram::new(0, vec![f0]).unwrap();
         eng.on_datagram_received(&dg0, t0()).unwrap();
-        assert!(eng.drain_ordered().is_empty(), "partial split not delivered");
+        assert!(
+            eng.drain_ordered().is_empty(),
+            "partial split not delivered"
+        );
 
         // Second fragment completes it.
         let f1 = Frame::new(Reliability::ReliableOrdered, vec![0x2])
             .with_order(0, 0)
-            .with_split(SplitInfo { count: 2, id: 1, index: 1 });
+            .with_split(SplitInfo {
+                count: 2,
+                id: 1,
+                index: 1,
+            });
         let dg1 = Datagram::new(1, vec![f1]).unwrap();
         eng.on_datagram_received(&dg1, t0()).unwrap();
         let drained = eng.drain_ordered();

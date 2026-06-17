@@ -26,6 +26,13 @@ thiserror = "2"
 clap = { version = "4", features = ["derive"] }
 rust-i18n = "3"
 sys-locale = "0.3"
+flate2 = "1"
+base64 = "0.22"
+p384 = "0.13"
+aes-gcm = "0.10"
+sha2 = "0.10"
+rand = "0.8"
+elliptic-curve = { version = "0.13", features = ["ecdh"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

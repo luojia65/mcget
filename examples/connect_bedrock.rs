@@ -66,8 +66,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     print_connection(&conn);
 
-    // Phase A: raw send/receive (lowest-level wire format).
-    raw_send_and_receive(&conn).await?;
+    // Phase A: raw send/receive (lowest-level wire format). This is OFF by
+    // default because a raw recv does not ACK the server's datagrams, which
+    // makes strict servers (NetherGames, …) give up on the session before the
+    // online handshake. Set MCGET_PHASE_A=1 to include it for debugging.
+    if std::env::var("MCGET_PHASE_A").is_ok() {
+        raw_send_and_receive(&conn).await?;
+    }
 
     // Phase B: reliable transport + online handshake.
     // The Connection moves into the ReliableConnection (its socket is taken).
@@ -97,20 +102,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     reliable.ping().await?;
     println!("  >> sent ok");
 
-    // Receive application frames for a few seconds. Once online, the server
-    // may send game-related packets; we just dump the first one we get.
-    println!("\n  << waiting for application frames (5s timeout)...");
-    match tokio::time::timeout(Duration::from_secs(5), reliable.recv()).await {
-        Ok(Ok(frame)) => {
-            println!(
-                "  << frame: reliability={:?} body_len={} first_byte=0x{:02x}",
-                frame.reliability(),
-                frame.body().len(),
-                frame.body().first().copied().unwrap_or(0)
-            );
-        }
-        Ok(Err(e)) => println!("  recv: {e}"),
-        Err(_) => println!("  << timed out (server sent no application frames yet)"),
+    // Phase C: offline Bedrock login (RequestNetworkSettings → Login →
+    // PlayStatus). This attempts a real game-layer login. Public servers
+    // (EaseCation, NetherGames, …) require encryption and won't reply to an
+    // offline login, so this typically times out or reports "server requires
+    // encryption". Against a local offline-mode BDS server it reaches
+    // PlayStatus(LOGIN_SUCCESS). The protocol version must match the server's.
+    println!("\n--- Phase C: offline Bedrock login ---");
+    println!("  >> running offline login (protocol 766, 15s timeout)...");
+    match reliable.login_offline(766, Duration::from_secs(15)).await {
+        Ok(()) => println!("  >> login successful (PlayStatus LOGIN_SUCCESS)"),
+        Err(e) => println!("  login result: {e}"),
     }
 
     // Graceful close: send a Disconnect notification.
@@ -147,12 +149,10 @@ async fn raw_send_and_receive(
     let datagram = Datagram::new(0, vec![frame])?;
 
     println!("  >> sending datagram (seq=0, 1 unreliable frame)...");
-    conn.send_datagram(&datagram)
-        .await
-        .map_err(|e| {
-            println!("  send FAILED: {e}");
-            Box::<dyn std::error::Error>::from(e)
-        })?;
+    conn.send_datagram(&datagram).await.map_err(|e| {
+        println!("  send FAILED: {e}");
+        Box::<dyn std::error::Error>::from(e)
+    })?;
     println!("  >> sent ok");
 
     println!("\n  << waiting for a packet (5s timeout)...");

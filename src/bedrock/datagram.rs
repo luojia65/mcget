@@ -320,7 +320,11 @@ impl Frame {
 
         let mut buf = Vec::with_capacity(3 + self.body.len() + 20);
         // Flags byte: reliability in the top 3 bits, split bit set if present.
-        let split_flag = if self.split.is_some() { 1 << FRAME_SPLIT_BIT } else { 0 };
+        let split_flag = if self.split.is_some() {
+            1 << FRAME_SPLIT_BIT
+        } else {
+            0
+        };
         buf.push((self.reliability.as_raw() << 5) | split_flag);
         buf.extend_from_slice(&body_bits.to_be_bytes());
         if let Some(idx) = self.reliable_index {
@@ -779,9 +783,8 @@ impl Frame {
             return Ok(vec![template.clone()]);
         }
         let count = body.len().div_ceil(max_body_bytes);
-        let count_u32 = u32::try_from(count).map_err(|_| {
-            PingError::Protocol(format!("too many split fragments: {count}"))
-        })?;
+        let count_u32 = u32::try_from(count)
+            .map_err(|_| PingError::Protocol(format!("too many split fragments: {count}")))?;
         let mut fragments = Vec::with_capacity(count);
         for (index, chunk) in body.chunks(max_body_bytes).enumerate() {
             let split = SplitInfo {
@@ -1009,7 +1012,11 @@ mod tests {
         // A reliable-ordered frame split into 3 fragments, each with body [0xAB].
         // Reliability 3 → flags high bits 0x60; split set → bit 4 → 0x70.
         let body = vec![0xAB];
-        let split = SplitInfo { count: 3, id: 0x1234, index: 1 };
+        let split = SplitInfo {
+            count: 3,
+            id: 0x1234,
+            index: 1,
+        };
         let f = Frame::new(Reliability::ReliableOrdered, body.clone())
             .with_reliable_index(7)
             .with_order(9, 0)
@@ -1027,8 +1034,11 @@ mod tests {
         // Unreliable (flags 0x00) split frame: body [0x42] (1 byte → 0x08 bits).
         // split_count=1 (BE: 00 00 00 01), split_id=0x0102 (BE: 01 02),
         // split_index=0 (BE: 00 00 00 00).
-        let f = Frame::new(Reliability::Unreliable, vec![0x42])
-            .with_split(SplitInfo { count: 1, id: 0x0102, index: 0 });
+        let f = Frame::new(Reliability::Unreliable, vec![0x42]).with_split(SplitInfo {
+            count: 1,
+            id: 0x0102,
+            index: 0,
+        });
         assert_eq!(
             f.encode().unwrap(),
             [
@@ -1084,8 +1094,7 @@ mod tests {
     fn frame_split_into_chunks_evenly() {
         // 10-byte body, max 4 bytes each → 3 fragments (4, 4, 2).
         let body: Vec<u8> = (0..10u8).collect();
-        let template =
-            Frame::new(Reliability::ReliableOrdered, body.clone()).with_order(0, 0);
+        let template = Frame::new(Reliability::ReliableOrdered, body.clone()).with_order(0, 0);
         let frags = Frame::split_into(&template, 4, 0xAB).unwrap();
         assert_eq!(frags.len(), 3);
         for (i, f) in frags.iter().enumerate() {
@@ -1122,15 +1131,36 @@ mod tests {
         // Fragments arriving out of order must reassemble in index order.
         let mut r = Reassembler::new();
         assert!(r
-            .add(SplitInfo { count: 3, id: 1, index: 2 }, vec![0x3])
+            .add(
+                SplitInfo {
+                    count: 3,
+                    id: 1,
+                    index: 2
+                },
+                vec![0x3]
+            )
             .unwrap()
             .is_none());
         assert!(r
-            .add(SplitInfo { count: 3, id: 1, index: 0 }, vec![0x1])
+            .add(
+                SplitInfo {
+                    count: 3,
+                    id: 1,
+                    index: 0
+                },
+                vec![0x1]
+            )
             .unwrap()
             .is_none());
         let assembled = r
-            .add(SplitInfo { count: 3, id: 1, index: 1 }, vec![0x2])
+            .add(
+                SplitInfo {
+                    count: 3,
+                    id: 1,
+                    index: 1,
+                },
+                vec![0x2],
+            )
             .unwrap()
             .expect("complete after 3rd fragment");
         assert_eq!(assembled, vec![0x1, 0x2, 0x3]); // index order, not arrival order
@@ -1139,18 +1169,48 @@ mod tests {
     #[test]
     fn reassembler_rejects_duplicate_index() {
         let mut r = Reassembler::new();
-        r.add(SplitInfo { count: 2, id: 1, index: 0 }, vec![0x1]).unwrap();
+        r.add(
+            SplitInfo {
+                count: 2,
+                id: 1,
+                index: 0,
+            },
+            vec![0x1],
+        )
+        .unwrap();
         assert!(r
-            .add(SplitInfo { count: 2, id: 1, index: 0 }, vec![0x9])
+            .add(
+                SplitInfo {
+                    count: 2,
+                    id: 1,
+                    index: 0
+                },
+                vec![0x9]
+            )
             .is_err());
     }
 
     #[test]
     fn reassembler_rejects_count_mismatch() {
         let mut r = Reassembler::new();
-        r.add(SplitInfo { count: 3, id: 1, index: 0 }, vec![0x1]).unwrap();
+        r.add(
+            SplitInfo {
+                count: 3,
+                id: 1,
+                index: 0,
+            },
+            vec![0x1],
+        )
+        .unwrap();
         assert!(r
-            .add(SplitInfo { count: 2, id: 1, index: 1 }, vec![0x2])
+            .add(
+                SplitInfo {
+                    count: 2,
+                    id: 1,
+                    index: 1
+                },
+                vec![0x2]
+            )
             .is_err());
     }
 
@@ -1158,7 +1218,14 @@ mod tests {
     fn reassembler_rejects_index_out_of_range() {
         let mut r = Reassembler::new();
         assert!(r
-            .add(SplitInfo { count: 2, id: 1, index: 5 }, vec![0x1])
+            .add(
+                SplitInfo {
+                    count: 2,
+                    id: 1,
+                    index: 5
+                },
+                vec![0x1]
+            )
             .is_err());
     }
 

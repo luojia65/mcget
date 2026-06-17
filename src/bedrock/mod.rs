@@ -38,6 +38,15 @@ pub mod reliable_conn;
 // Connected system messages (ConnectedPing/Pong, online handshake, Disconnect):
 // the small protocol packets carried inside datagram frames.
 pub mod message;
+// Bedrock game-layer protocol: batch encapsulation, zlib, varuint32, packet IDs.
+// Independent of RakNet (datagrams/frames/ACK).
+pub mod protocol;
+// Bedrock offline login: JWT chain construction + login-stage packet codec.
+// Independent of RakNet; integrates with ReliableConnection for transport.
+pub mod login;
+// Bedrock login encryption: ECDH (P-384) key agreement + AES-256-GCM stream.
+// Independent of RakNet; consumed by the login flow on ServerToClientHandshake.
+pub mod encryption;
 
 pub use ping::{ping as ping_bedrock_inner, Client, PongResponse, RequestBuilder};
 // MAGIC is defined in `raknet` and surfaced here so the public path

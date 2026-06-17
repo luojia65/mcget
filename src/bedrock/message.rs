@@ -160,7 +160,10 @@ impl ConnectedPong {
     pub fn decode(data: &[u8]) -> Result<Self> {
         let ping_time = read_i64_be(&data[0..], "ConnectedPong.ping_time")?;
         let pong_time = read_i64_be(&data[8..], "ConnectedPong.pong_time")?;
-        Ok(Self { ping_time, pong_time })
+        Ok(Self {
+            ping_time,
+            pong_time,
+        })
     }
 }
 
@@ -178,7 +181,11 @@ impl ConnectionRequest {
         let client_guid = read_i64_be(&data[0..], "ConnectionRequest.client_guid")?;
         let request_time = read_i64_be(&data[8..], "ConnectionRequest.request_time")?;
         let use_security = data.get(16).copied().unwrap_or(0) != 0;
-        Ok(Self { client_guid, request_time, use_security })
+        Ok(Self {
+            client_guid,
+            request_time,
+            use_security,
+        })
     }
 }
 
@@ -205,19 +212,30 @@ impl ConnectionRequestAccepted {
 
     pub fn decode(data: &[u8]) -> Result<Self> {
         let mut off = 0;
-        let (client_address, n) = decode_addr_v4(&data[off..], "ConnectionRequestAccepted.client_address")?;
+        let (client_address, n) =
+            decode_addr_v4(&data[off..], "ConnectionRequestAccepted.client_address")?;
         off += n;
-        let system_index = read_u16_be(&data[off..off + 2], "ConnectionRequestAccepted.system_index")?;
+        let system_index = read_u16_be(
+            &data[off..off + 2],
+            "ConnectionRequestAccepted.system_index",
+        )?;
         off += 2;
         let mut system_addresses = Vec::with_capacity(SYSTEM_ADDRESS_COUNT);
         for _ in 0..SYSTEM_ADDRESS_COUNT {
-            let (addr, n) = decode_addr_v4(&data[off..], "ConnectionRequestAccepted.system_address")?;
+            let (addr, n) =
+                decode_addr_v4(&data[off..], "ConnectionRequestAccepted.system_address")?;
             system_addresses.push(addr);
             off += n;
         }
         let ping_time = read_i64_be(&data[off..], "ConnectionRequestAccepted.ping_time")?;
         let pong_time = read_i64_be(&data[off + 8..], "ConnectionRequestAccepted.pong_time")?;
-        Ok(Self { client_address, system_index, system_addresses, ping_time, pong_time })
+        Ok(Self {
+            client_address,
+            system_index,
+            system_addresses,
+            ping_time,
+            pong_time,
+        })
     }
 }
 
@@ -230,7 +248,10 @@ impl NewIncomingConnection {
             b.extend_from_slice(&encode_addr_v4(addr));
         }
         for _ in self.system_addresses.len()..SYSTEM_ADDRESS_COUNT {
-            b.extend_from_slice(&encode_addr_v4(&SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0)));
+            b.extend_from_slice(&encode_addr_v4(&SocketAddrV4::new(
+                Ipv4Addr::new(0, 0, 0, 0),
+                0,
+            )));
         }
         b.extend_from_slice(&self.ping_time.to_be_bytes());
         b.extend_from_slice(&self.pong_time.to_be_bytes());
@@ -239,7 +260,8 @@ impl NewIncomingConnection {
 
     pub fn decode(data: &[u8]) -> Result<Self> {
         let mut off = 0;
-        let (server_address, n) = decode_addr_v4(&data[off..], "NewIncomingConnection.server_address")?;
+        let (server_address, n) =
+            decode_addr_v4(&data[off..], "NewIncomingConnection.server_address")?;
         off += n;
         let mut system_addresses = Vec::with_capacity(SYSTEM_ADDRESS_COUNT);
         for _ in 0..SYSTEM_ADDRESS_COUNT {
@@ -249,7 +271,12 @@ impl NewIncomingConnection {
         }
         let ping_time = read_i64_be(&data[off..], "NewIncomingConnection.ping_time")?;
         let pong_time = read_i64_be(&data[off + 8..], "NewIncomingConnection.pong_time")?;
-        Ok(Self { server_address, system_addresses, ping_time, pong_time })
+        Ok(Self {
+            server_address,
+            system_addresses,
+            ping_time,
+            pong_time,
+        })
     }
 }
 
@@ -354,22 +381,20 @@ impl SystemMessage {
 /// Classifies a frame body by its leading byte into a [`SystemMessage`], or
 /// [`SystemMessage::Application`] if it is not a recognised system message.
 pub fn classify(body: &[u8]) -> Result<SystemMessage> {
-    let id = *body.first().ok_or_else(|| {
-        PingError::Protocol("cannot classify an empty frame body".to_string())
-    })?;
+    let id = *body
+        .first()
+        .ok_or_else(|| PingError::Protocol("cannot classify an empty frame body".to_string()))?;
     let rest = &body[1..];
     Ok(match id {
         ID_CONNECTED_PING => SystemMessage::ConnectedPing(ConnectedPing::decode(rest)?),
         ID_CONNECTED_PONG => SystemMessage::ConnectedPong(ConnectedPong::decode(rest)?),
-        ID_CONNECTION_REQUEST => {
-            SystemMessage::ConnectionRequest(ConnectionRequest::decode(rest)?)
+        ID_CONNECTION_REQUEST => SystemMessage::ConnectionRequest(ConnectionRequest::decode(rest)?),
+        ID_CONNECTION_REQUEST_ACCEPTED => {
+            SystemMessage::ConnectionRequestAccepted(ConnectionRequestAccepted::decode(rest)?)
         }
-        ID_CONNECTION_REQUEST_ACCEPTED => SystemMessage::ConnectionRequestAccepted(
-            ConnectionRequestAccepted::decode(rest)?,
-        ),
-        ID_NEW_INCOMING_CONNECTION => SystemMessage::NewIncomingConnection(
-            NewIncomingConnection::decode(rest)?,
-        ),
+        ID_NEW_INCOMING_CONNECTION => {
+            SystemMessage::NewIncomingConnection(NewIncomingConnection::decode(rest)?)
+        }
         ID_DISCONNECT => SystemMessage::Disconnect(Disconnect::decode(rest)?),
         _ => SystemMessage::Application(body.to_vec()),
     })
@@ -383,7 +408,9 @@ mod tests {
 
     #[test]
     fn connected_ping_round_trip() {
-        let m = ConnectedPing { time: 0x0102030405060708 };
+        let m = ConnectedPing {
+            time: 0x0102030405060708,
+        };
         let bytes = m.encode();
         assert_eq!(bytes[0], ID_CONNECTED_PING);
         assert_eq!(bytes.len(), 9);
@@ -400,7 +427,10 @@ mod tests {
 
     #[test]
     fn connected_pong_round_trip() {
-        let m = ConnectedPong { ping_time: 100, pong_time: 200 };
+        let m = ConnectedPong {
+            ping_time: 100,
+            pong_time: 200,
+        };
         let bytes = m.encode();
         assert_eq!(bytes[0], ID_CONNECTED_PONG);
         assert_eq!(bytes.len(), 17);
@@ -410,7 +440,11 @@ mod tests {
 
     #[test]
     fn connection_request_round_trip() {
-        let m = ConnectionRequest { client_guid: -1, request_time: 42, use_security: false };
+        let m = ConnectionRequest {
+            client_guid: -1,
+            request_time: 42,
+            use_security: false,
+        };
         let bytes = m.encode();
         assert_eq!(bytes[0], ID_CONNECTION_REQUEST);
         assert_eq!(bytes.len(), 18);
@@ -420,7 +454,11 @@ mod tests {
 
     #[test]
     fn connection_request_security_flag_round_trips() {
-        let m = ConnectionRequest { client_guid: 7, request_time: 9, use_security: true };
+        let m = ConnectionRequest {
+            client_guid: 7,
+            request_time: 9,
+            use_security: true,
+        };
         let back = ConnectionRequest::decode(&m.encode()[1..]).unwrap();
         assert!(back.use_security);
     }
@@ -457,7 +495,7 @@ mod tests {
         assert_eq!(enc[0], 4); // family
         assert_eq!(&enc[1..5], &[128, 255, 255, 254]); // NOTed octets
         assert_eq!(&enc[5..7], &19132u16.to_be_bytes()); // port BE
-        // Round-trip.
+                                                         // Round-trip.
         let (back, n) = decode_addr_v4(&enc, "test").unwrap();
         assert_eq!(back, addr);
         assert_eq!(n, 7);
@@ -490,11 +528,24 @@ mod tests {
     fn classify_routes_each_message() {
         // Build each message, classify the encoded body, expect the right variant.
         let ping = ConnectedPing { time: 1 }.encode();
-        assert!(matches!(classify(&ping).unwrap(), SystemMessage::ConnectedPing(_)));
-        let pong = ConnectedPong { ping_time: 1, pong_time: 2 }.encode();
-        assert!(matches!(classify(&pong).unwrap(), SystemMessage::ConnectedPong(_)));
+        assert!(matches!(
+            classify(&ping).unwrap(),
+            SystemMessage::ConnectedPing(_)
+        ));
+        let pong = ConnectedPong {
+            ping_time: 1,
+            pong_time: 2,
+        }
+        .encode();
+        assert!(matches!(
+            classify(&pong).unwrap(),
+            SystemMessage::ConnectedPong(_)
+        ));
         let disc = Disconnect.encode();
-        assert!(matches!(classify(&disc).unwrap(), SystemMessage::Disconnect(_)));
+        assert!(matches!(
+            classify(&disc).unwrap(),
+            SystemMessage::Disconnect(_)
+        ));
     }
 
     #[test]

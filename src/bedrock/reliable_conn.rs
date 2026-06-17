@@ -34,10 +34,12 @@
 
 use super::conn::Connection;
 use super::datagram::{Acknowledgement, Frame, Incoming, Reliability};
+use super::login::{self, NetworkSettings, PlayStatus};
 use super::message::{
     self, ConnectedPing, ConnectionRequest, ConnectionRequestAccepted, NewIncomingConnection,
     SystemMessage,
 };
+use super::protocol::{self, GamePacket, ID_BATCH};
 use super::reliability::ReliabilityEngine;
 use crate::error::{PingError, Result};
 use std::net::{Ipv4Addr, SocketAddrV4};
@@ -95,6 +97,9 @@ pub struct ReliableConnection {
     socket: Arc<UdpSocket>,
     engine: Arc<Mutex<ReliabilityEngine>>,
     state: Arc<Mutex<SessionState>>,
+    /// Login-layer encryption session, established after ServerToClientHandshake.
+    /// When `Some`, every batch frame body is AES-GCM encrypted/decrypted.
+    encryption: Arc<Mutex<Option<super::encryption::EncryptionSession>>>,
     /// Outgoing bytes produced by the tick task (ACK/NACK packets, resends)
     /// that the owner must transmit. Drained lazily inside [`Self::recv`] and
     /// eagerly inside [`Self::send`].
@@ -107,6 +112,8 @@ pub struct ReliableConnection {
     mtu: u16,
     server_guid: i64,
     client_guid: i64,
+    /// Compression settings negotiated via NetworkSettings during login.
+    network_settings: Arc<Mutex<Option<NetworkSettings>>>,
     /// Handle to the background tick task; aborted on drop.
     _tick: JoinHandle<()>,
 }
@@ -121,6 +128,8 @@ impl ReliableConnection {
         let socket = Arc::new(conn.into_socket());
         let engine = Arc::new(Mutex::new(ReliabilityEngine::new(Instant::now())));
         let state = Arc::new(Mutex::new(SessionState::default()));
+        let network_settings = Arc::new(Mutex::new(None));
+        let encryption = Arc::new(Mutex::new(None));
 
         let (outgoing_tx, outgoing_rx) = mpsc::channel(OUTGOING_CHANNEL);
         let (delivery_tx, delivery_rx) = mpsc::channel(DELIVERY_CHANNEL);
@@ -141,6 +150,8 @@ impl ReliableConnection {
             mtu,
             server_guid,
             client_guid,
+            network_settings,
+            encryption,
             _tick: tick,
         }
     }
@@ -238,7 +249,8 @@ impl ReliableConnection {
             request_time: current_millis(),
             use_security: false,
         };
-        self.send(Reliability::ReliableOrdered, req.encode()).await?;
+        self.send(Reliability::ReliableOrdered, req.encode())
+            .await?;
 
         // 2. Pump recv until the state flips to "online" (set when the recv loop
         //    finishes replying to ConnectionRequestAccepted) or the timeout fires.
@@ -260,7 +272,8 @@ impl ReliableConnection {
             // Pump one packet to make progress; a short timeout keeps the loop
             // responsive to the deadline.
             let mut buf = vec![0u8; self.mtu as usize + 1];
-            match tokio::time::timeout(Duration::from_millis(100), self.socket.recv(&mut buf)).await {
+            match tokio::time::timeout(Duration::from_millis(100), self.socket.recv(&mut buf)).await
+            {
                 Ok(Ok(n)) => self.handle_incoming(&buf[..n]).await?,
                 Ok(Err(e)) => return Err(PingError::Io(e)),
                 Err(_) => self.flush_outgoing().await,
@@ -294,7 +307,9 @@ impl ReliableConnection {
     /// Sends a [`message::ConnectedPing`] keep-alive. The recv loop replies to
     /// the server's pings automatically with [`message::ConnectedPong`].
     pub async fn ping(&self) -> Result<()> {
-        let ping = ConnectedPing { time: current_millis() };
+        let ping = ConnectedPing {
+            time: current_millis(),
+        };
         self.send(Reliability::Unreliable, ping.encode()).await
     }
 
@@ -304,6 +319,185 @@ impl ReliableConnection {
         self.send(Reliability::ReliableOrdered, message::Disconnect.encode())
             .await?;
         Ok(())
+    }
+
+    // ====== Game-layer (Bedrock protocol) integration ======
+
+    /// Handles a received `ServerToClientHandshake`: parses its JWT to recover
+    /// the server's P-384 public key and salt, performs ECDH key agreement to
+    /// derive an AES-256-GCM session, sends `ClientToServerHandshake` (the first
+    /// encrypted packet), and flips encryption on for all subsequent traffic.
+    async fn establish_encryption(&self, handshake_payload: &[u8]) -> Result<()> {
+        let hs = login::ServerHandshake::decode_payload(handshake_payload)?;
+        let mut session = super::encryption::EncryptionSession::from_handshake(
+            &hs.server_public_key_b64,
+            &hs.salt,
+        )?;
+        // Build the ClientToServerHandshake game packet: a single length-prefixed
+        // field carrying the encrypted empty payload.
+        let c2s_payload = session.encrypt_handshake()?;
+        let c2s = protocol::GamePacket::new(super::protocol::ID_CLIENT_TO_SERVER_HANDSHAKE, {
+            // The field is varuint32(encrypted_len) + encrypted bytes.
+            let mut field = protocol::write_varuint32(c2s_payload.len() as u32);
+            field.extend_from_slice(&c2s_payload);
+            field
+        });
+        // Install the session BEFORE sending so send_game_packet encrypts this
+        // very packet (the ClientToServerHandshake batch must be encrypted).
+        *self.encryption.lock().await = Some(session);
+        self.send_game_packet(&c2s).await
+    }
+
+    /// Sends a [`GamePacket`] as a compressed batch frame. The packet is wrapped
+    /// in a batch (zlib, per the negotiated [`NetworkSettings`] or flate by
+    /// default) and handed to the reliability layer with `ReliableOrdered`. If
+    /// the login-layer encryption is active, the whole batch body (including the
+    /// `0xfe` prefix) is AES-GCM encrypted first.
+    pub async fn send_game_packet(&self, packet: &GamePacket) -> Result<()> {
+        // Before NetworkSettings is negotiated, send the legacy batch format
+        // (no algorithm-prefix byte) — the server hasn't told us which format
+        // it expects yet, and many servers reject the modern prefixed format
+        // pre-login. Once NetworkSettings arrives we honour its algorithm.
+        let ns = self.network_settings.lock().await.clone();
+        let (algorithm, use_prefix) = match &ns {
+            Some(ns) => (ns.compression_algorithm, true),
+            None => (protocol::COMPRESSION_FLATE, false),
+        };
+        let batch = if use_prefix {
+            protocol::encode_batch(std::slice::from_ref(packet), algorithm)?
+        } else {
+            protocol::encode_batch_legacy(std::slice::from_ref(packet))?
+        };
+        // If encryption is active, encrypt the whole batch body (0xfe + payload).
+        let frame_body = {
+            let mut enc = self.encryption.lock().await;
+            match enc.as_mut() {
+                Some(session) => session.encrypt(&batch)?,
+                None => batch,
+            }
+        };
+        self.send(Reliability::ReliableOrdered, frame_body).await
+    }
+
+    /// Receives the next [`GamePacket`] from the server. Internally this pumps
+    /// [`recv`](Self::recv) until a frame carrying a batch arrives; the batch is
+    /// decompressed (and, if encryption is active, decrypted) and its first game
+    /// packet is returned. Non-batch frames (e.g. stray system messages) are
+    /// skipped.
+    pub async fn recv_game_packet(&self) -> Result<GamePacket> {
+        loop {
+            let frame = self.recv().await?;
+            // If encryption is active, every frame carrying a batch is encrypted
+            // (no 0xfe prefix visible). Decrypt first, then decode.
+            let body: Vec<u8> = {
+                let mut enc = self.encryption.lock().await;
+                match enc.as_mut() {
+                    Some(session) => session.decrypt(frame.body())?,
+                    None => frame.body().to_vec(),
+                }
+            };
+            // After decryption (or if unencrypted) a batch starts with 0xfe.
+            if body.first().copied() == Some(ID_BATCH as u8) {
+                let packets = protocol::decode_batch(&body)?;
+                if let Some(first) = packets.into_iter().next() {
+                    return Ok(first);
+                }
+            }
+            // Otherwise loop: ignore non-batch frames (system messages).
+        }
+    }
+
+    /// Runs the **offline Bedrock login**: requests network settings, sends the
+    /// login chain, and waits for PlayStatus(LOGIN_SUCCESS). Fails if the server
+    /// requires encryption (ServerToClientHandshake) or rejects the login.
+    ///
+    /// `protocol_version` is the Bedrock protocol number (e.g. 685 for 1.21.80).
+    pub async fn login_offline(
+        &self,
+        protocol_version: i32,
+        deadline_timeout: Duration,
+    ) -> Result<()> {
+        // 1. Request network settings.
+        self.send_game_packet(&login::request_network_settings_packet(protocol_version))
+            .await?;
+
+        // 2. Wait for NetworkSettings (or an early encryption request / disconnect).
+        let deadline = Instant::now() + deadline_timeout;
+        loop {
+            if Instant::now() >= deadline {
+                return Err(PingError::Protocol(
+                    "login timed out waiting for NetworkSettings".to_string(),
+                ));
+            }
+            let pkt = self.recv_game_packet_with_deadline(deadline).await?;
+            match pkt.id {
+                super::protocol::ID_NETWORK_SETTINGS => {
+                    let ns = NetworkSettings::decode_payload(&pkt.payload)?;
+                    *self.network_settings.lock().await = Some(ns);
+                    break; // proceed to send Login
+                }
+                super::protocol::ID_SERVER_TO_CLIENT_HANDSHAKE => {
+                    // Some servers send the handshake before NetworkSettings.
+                    self.establish_encryption(&pkt.payload).await?;
+                }
+                super::protocol::ID_PLAY_STATUS => {
+                    let ps = PlayStatus::decode_payload(&pkt.payload)?;
+                    return Err(PingError::Protocol(format!(
+                        "server rejected login before NetworkSettings: PlayStatus({})",
+                        ps.status
+                    )));
+                }
+                _ => { /* ignore unexpected packets, keep waiting */ }
+            }
+        }
+
+        // 3. Send Login with the offline JWT chain.
+        let conn_req = login::default_offline_connection_request(self.client_guid)?;
+        self.send_game_packet(&login::login_packet(protocol_version, conn_req))
+            .await?;
+
+        // 4. Wait for PlayStatus(LOGIN_SUCCESS) (or ServerToClientHandshake, which
+        //    means the server wants to establish login-layer encryption).
+        loop {
+            if Instant::now() >= deadline {
+                return Err(PingError::Protocol(
+                    "login timed out waiting for PlayStatus".to_string(),
+                ));
+            }
+            let pkt = self.recv_game_packet_with_deadline(deadline).await?;
+            match pkt.id {
+                super::protocol::ID_PLAY_STATUS => {
+                    let ps = PlayStatus::decode_payload(&pkt.payload)?;
+                    return match ps.status {
+                        login::play_status::LOGIN_SUCCESS => Ok(()),
+                        other => Err(PingError::Protocol(format!(
+                            "login rejected: PlayStatus({other})"
+                        ))),
+                    };
+                }
+                super::protocol::ID_SERVER_TO_CLIENT_HANDSHAKE => {
+                    // Establish the login-layer encryption: parse the JWT,
+                    // derive the AES key/IV, send ClientToServerHandshake, and
+                    // flip encryption on for all subsequent packets.
+                    self.establish_encryption(&pkt.payload).await?;
+                    // After encryption is on, continue waiting for PlayStatus
+                    // (which now arrives encrypted).
+                }
+                _ => { /* ignore */ }
+            }
+        }
+    }
+
+    /// Like [`recv_game_packet`](Self::recv_game_packet) but bounded by a
+    /// deadline; used internally by [`login_offline`](Self::login_offline).
+    async fn recv_game_packet_with_deadline(&self, deadline: Instant) -> Result<GamePacket> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match timeout(remaining, self.recv_game_packet()).await {
+            Ok(r) => r,
+            Err(_) => Err(PingError::Protocol(
+                "login timed out waiting for a game packet".to_string(),
+            )),
+        }
     }
 
     /// Processes one classified-or-raw incoming packet: ACK/NACK drive the
@@ -331,8 +525,8 @@ impl ReliableConnection {
                     let ordered = eng.drain_ordered();
                     (immediate, ordered)
                 };
-                let frames = immediate.into_iter().chain(ordered);
-                for frame in frames {
+                let frames_vec: Vec<_> = immediate.into_iter().chain(ordered).collect();
+                for frame in frames_vec {
                     // Classify each delivered frame body: system messages are
                     // handled internally (ping→pong, handshake, disconnect),
                     // application frames are forwarded to the caller.
@@ -389,7 +583,8 @@ impl ReliableConnection {
                     // tick task will retry on the next resend window.
                     let _ = self.socket.send(&bytes).await;
                 }
-                Err(mpsc::error::TryRecvError::Empty) | Err(mpsc::error::TryRecvError::Disconnected) => break,
+                Err(mpsc::error::TryRecvError::Empty)
+                | Err(mpsc::error::TryRecvError::Disconnected) => break,
             }
         }
     }
