@@ -34,8 +34,13 @@
 
 use super::conn::Connection;
 use super::datagram::{Acknowledgement, Frame, Incoming, Reliability};
+use super::message::{
+    self, ConnectedPing, ConnectionRequest, ConnectionRequestAccepted, NewIncomingConnection,
+    SystemMessage,
+};
 use super::reliability::ReliabilityEngine;
 use crate::error::{PingError, Result};
+use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
@@ -65,6 +70,21 @@ fn max_frame_body(mtu: u16) -> usize {
     (mtu as usize).saturating_sub(reserved)
 }
 
+/// Shared session state read/written by the recv path, the online handshake,
+/// and (for ping timing) the tick task. Lives behind a `Mutex`.
+#[derive(Debug, Default)]
+struct SessionState {
+    /// True once the online handshake (Request→Accepted→NewIncoming) is done.
+    online: bool,
+    /// The server's system addresses as advertised in
+    /// [`ConnectionRequestAccepted`] (echoed back in NewIncomingConnection).
+    server_system_addresses: Vec<SocketAddrV4>,
+    /// The last Pong we received (ping/pong time), for latency measurement.
+    last_pong: Option<(i64, i64)>,
+    /// Set when the server sent a [`message::Disconnect`].
+    disconnected: bool,
+}
+
 /// A reliable, ordered, retransmitting session built on top of a [`Connection`].
 ///
 /// Created with [`ReliableConnection::new`], which takes ownership of the
@@ -74,6 +94,7 @@ fn max_frame_body(mtu: u16) -> usize {
 pub struct ReliableConnection {
     socket: Arc<UdpSocket>,
     engine: Arc<Mutex<ReliabilityEngine>>,
+    state: Arc<Mutex<SessionState>>,
     /// Outgoing bytes produced by the tick task (ACK/NACK packets, resends)
     /// that the owner must transmit. Drained lazily inside [`Self::recv`] and
     /// eagerly inside [`Self::send`].
@@ -85,6 +106,7 @@ pub struct ReliableConnection {
     delivery_rx: Mutex<mpsc::Receiver<Frame>>,
     mtu: u16,
     server_guid: i64,
+    client_guid: i64,
     /// Handle to the background tick task; aborted on drop.
     _tick: JoinHandle<()>,
 }
@@ -95,8 +117,10 @@ impl ReliableConnection {
     pub fn new(conn: Connection) -> Self {
         let mtu = conn.mtu();
         let server_guid = conn.server_guid();
+        let client_guid = conn.client_guid();
         let socket = Arc::new(conn.into_socket());
         let engine = Arc::new(Mutex::new(ReliabilityEngine::new(Instant::now())));
+        let state = Arc::new(Mutex::new(SessionState::default()));
 
         let (outgoing_tx, outgoing_rx) = mpsc::channel(OUTGOING_CHANNEL);
         let (delivery_tx, delivery_rx) = mpsc::channel(DELIVERY_CHANNEL);
@@ -110,11 +134,13 @@ impl ReliableConnection {
         Self {
             socket,
             engine,
+            state,
             outgoing_rx: Mutex::new(outgoing_rx),
             delivery_tx,
             delivery_rx: Mutex::new(delivery_rx),
             mtu,
             server_guid,
+            client_guid,
             _tick: tick,
         }
     }
@@ -184,6 +210,102 @@ impl ReliableConnection {
         self.server_guid
     }
 
+    /// This client's GUID.
+    pub fn client_guid(&self) -> i64 {
+        self.client_guid
+    }
+
+    /// Whether the online handshake has completed (the server accepted the
+    /// connection via ConnectionRequestAccepted and we replied
+    /// NewIncomingConnection).
+    pub async fn is_online(&self) -> bool {
+        self.state.lock().await.online
+    }
+
+    /// Runs the **online handshake**: sends a [`ConnectionRequest`], waits for
+    /// the server's [`ConnectionRequestAccepted`] (the recv loop replies with
+    /// [`NewIncomingConnection`] automatically), and marks the session online.
+    ///
+    /// After this returns `Ok(())` the server treats us as a fully connected
+    /// client and will begin sending application frames.
+    ///
+    /// `timeout` bounds the whole exchange. Call this once, right after
+    /// [`ReliableConnection::new`].
+    pub async fn connect_online(&self, timeout: Duration) -> Result<()> {
+        // 1. Send the ConnectionRequest.
+        let req = ConnectionRequest {
+            client_guid: self.client_guid,
+            request_time: current_millis(),
+            use_security: false,
+        };
+        self.send(Reliability::ReliableOrdered, req.encode()).await?;
+
+        // 2. Pump recv until the state flips to "online" (set when the recv loop
+        //    finishes replying to ConnectionRequestAccepted) or the timeout fires.
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.is_online().await {
+                return Ok(());
+            }
+            if self.state.lock().await.disconnected {
+                return Err(PingError::Protocol(
+                    "server disconnected during online handshake".to_string(),
+                ));
+            }
+            if Instant::now() >= deadline {
+                return Err(PingError::Protocol(
+                    "online handshake timed out waiting for ConnectionRequestAccepted".to_string(),
+                ));
+            }
+            // Pump one packet to make progress; a short timeout keeps the loop
+            // responsive to the deadline.
+            let mut buf = vec![0u8; self.mtu as usize + 1];
+            match tokio::time::timeout(Duration::from_millis(100), self.socket.recv(&mut buf)).await {
+                Ok(Ok(n)) => self.handle_incoming(&buf[..n]).await?,
+                Ok(Err(e)) => return Err(PingError::Io(e)),
+                Err(_) => self.flush_outgoing().await,
+            }
+        }
+    }
+
+    /// Called when a [`ConnectionRequestAccepted`] arrives: stores the server's
+    /// system addresses and replies with [`NewIncomingConnection`] to finalise
+    /// the online handshake.
+    async fn on_request_accepted(&self, accepted: &ConnectionRequestAccepted) -> Result<()> {
+        let server_address = accepted
+            .system_addresses
+            .first()
+            .copied()
+            .unwrap_or_else(|| SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0));
+        let new_incoming = NewIncomingConnection {
+            server_address,
+            system_addresses: accepted.system_addresses.clone(),
+            ping_time: accepted.pong_time,
+            pong_time: current_millis(),
+        };
+        self.send(Reliability::ReliableOrdered, new_incoming.encode())
+            .await?;
+        let mut st = self.state.lock().await;
+        st.online = true;
+        st.server_system_addresses = accepted.system_addresses.clone();
+        Ok(())
+    }
+
+    /// Sends a [`message::ConnectedPing`] keep-alive. The recv loop replies to
+    /// the server's pings automatically with [`message::ConnectedPong`].
+    pub async fn ping(&self) -> Result<()> {
+        let ping = ConnectedPing { time: current_millis() };
+        self.send(Reliability::Unreliable, ping.encode()).await
+    }
+
+    /// Gracefully closes the session by sending a [`message::Disconnect`], then
+    /// stops the background task. The socket is released on drop.
+    pub async fn disconnect(&self) -> Result<()> {
+        self.send(Reliability::ReliableOrdered, message::Disconnect.encode())
+            .await?;
+        Ok(())
+    }
+
     /// Processes one classified-or-raw incoming packet: ACK/NACK drive the
     /// engine's bookkeeping; datagrams yield (possibly ordered) frames.
     async fn handle_incoming(&self, data: &[u8]) -> Result<()> {
@@ -203,18 +325,51 @@ impl ReliableConnection {
                 }
             }
             Incoming::Datagram(dg) => {
-                let frames = {
+                let (immediate, ordered) = {
                     let mut eng = self.engine.lock().await;
-                    eng.on_datagram_received(&dg, Instant::now())?;
-                    eng.drain_ordered()
+                    let immediate = eng.on_datagram_received(&dg, Instant::now())?;
+                    let ordered = eng.drain_ordered();
+                    (immediate, ordered)
                 };
+                let frames = immediate.into_iter().chain(ordered);
                 for frame in frames {
-                    // try_send so a full delivery queue doesn't deadlock the
-                    // receive loop; a backed-up caller surfaces as an error.
-                    if self.delivery_tx.try_send(frame).is_err() {
-                        return Err(PingError::Protocol(
-                            "delivery queue full; application recv too slow".to_string(),
-                        ));
+                    // Classify each delivered frame body: system messages are
+                    // handled internally (ping→pong, handshake, disconnect),
+                    // application frames are forwarded to the caller.
+                    match message::classify(frame.body())? {
+                        SystemMessage::ConnectedPing(ping) => {
+                            // Reply with a ConnectedPong carrying both timestamps.
+                            let pong = message::ConnectedPong {
+                                ping_time: ping.time,
+                                pong_time: current_millis(),
+                            };
+                            self.send(Reliability::Unreliable, pong.encode()).await?;
+                        }
+                        SystemMessage::ConnectedPong(pong) => {
+                            let mut st = self.state.lock().await;
+                            st.last_pong = Some((pong.ping_time, pong.pong_time));
+                        }
+                        SystemMessage::ConnectionRequestAccepted(accepted) => {
+                            // The server accepted our online request. We should
+                            // reply with NewIncomingConnection to finalise.
+                            self.on_request_accepted(&accepted).await?;
+                        }
+                        SystemMessage::Disconnect(_) => {
+                            let mut st = self.state.lock().await;
+                            st.disconnected = true;
+                        }
+                        // Forward application-layer frames (and messages we
+                        // originate ourselves, like ConnectionRequest /
+                        // NewIncomingConnection) to the caller.
+                        SystemMessage::ConnectionRequest(_)
+                        | SystemMessage::NewIncomingConnection(_)
+                        | SystemMessage::Application(_) => {
+                            if self.delivery_tx.try_send(frame).is_err() {
+                                return Err(PingError::Protocol(
+                                    "delivery queue full; application recv too slow".to_string(),
+                                ));
+                            }
+                        }
                     }
                 }
                 // The ACK for this datagram is flushed by the tick task.
@@ -298,4 +453,14 @@ async fn tick_loop(
 /// the packet is malformed (which the engine never produces).
 fn encode_acknowledgement(ack: &Acknowledgement) -> Result<Vec<u8>> {
     ack.encode()
+}
+
+/// Current time as milliseconds since the UNIX epoch (the timestamp RakNet
+/// system messages carry).
+fn current_millis() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }

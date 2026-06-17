@@ -35,6 +35,9 @@ mod reliability;
 // Async reliable transport wrapper around `Connection`: the send/receive loop
 // that drives the reliability engine.
 pub mod reliable_conn;
+// Connected system messages (ConnectedPing/Pong, online handshake, Disconnect):
+// the small protocol packets carried inside datagram frames.
+pub mod message;
 
 pub use ping::{ping as ping_bedrock_inner, Client, PongResponse, RequestBuilder};
 // MAGIC is defined in `raknet` and surfaced here so the public path

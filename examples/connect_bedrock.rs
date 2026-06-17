@@ -69,9 +69,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Phase A: raw send/receive (lowest-level wire format).
     raw_send_and_receive(&conn).await?;
 
-    // Phase B: reliable transport (auto-ACK, retransmit, ordered delivery).
+    // Phase B: reliable transport + online handshake.
     // The Connection moves into the ReliableConnection (its socket is taken).
-    println!("\n--- Phase B: reliable transport ---");
+    println!("\n--- Phase B: reliable transport + online handshake ---");
     let reliable = ReliableConnection::new(conn);
     println!(
         "  reliable session up: server_guid={} mtu={}",
@@ -79,36 +79,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         reliable.mtu()
     );
 
-    // Send a reliable-ordered frame. The reliability layer assigns sequence
-    // numbers / indices, encapsulates, and will retransmit until ACKed.
-    println!("\n  >> sending reliable-ordered frame...");
-    reliable
-        .send(Reliability::ReliableOrdered, vec![0x00; 4])
-        .await?;
+    // Run the online handshake: ConnectionRequest → ConnectionRequestAccepted
+    // → NewIncomingConnection. After this the server treats us as a fully
+    // connected client and may send application frames.
+    println!("\n  >> running online handshake (10s timeout)...");
+    match reliable.connect_online(Duration::from_secs(10)).await {
+        Ok(()) => println!("  >> online handshake complete"),
+        Err(e) => {
+            println!("  online handshake FAILED: {e}");
+            return Err(e.into());
+        }
+    }
+
+    // Send a ConnectedPing keep-alive (the recv loop auto-replies Pong to the
+    // server's pings).
+    println!("\n  >> sending ConnectedPing...");
+    reliable.ping().await?;
     println!("  >> sent ok");
 
-    // Receive one application frame (the engine ACKs the server's datagrams,
-    // reassembles fragments, and delivers ordered frames in order).
-    println!("\n  << waiting for a reliable frame (5s timeout)...");
+    // Receive application frames for a few seconds. Once online, the server
+    // may send game-related packets; we just dump the first one we get.
+    println!("\n  << waiting for application frames (5s timeout)...");
     match tokio::time::timeout(Duration::from_secs(5), reliable.recv()).await {
         Ok(Ok(frame)) => {
             println!(
-                "  << frame: reliability={:?} body_len={}",
+                "  << frame: reliability={:?} body_len={} first_byte=0x{:02x}",
                 frame.reliability(),
-                frame.body().len()
+                frame.body().len(),
+                frame.body().first().copied().unwrap_or(0)
             );
         }
-        Ok(Err(e)) => {
-            println!("  recv FAILED: {e}");
-            return Err(e.into());
-        }
-        Err(_) => println!("  << timed out waiting for a reliable frame"),
+        Ok(Err(e)) => println!("  recv: {e}"),
+        Err(_) => println!("  << timed out (server sent no application frames yet)"),
     }
 
-    // Dropping the ReliableConnection aborts the background tick task and
-    // closes the socket (no graceful 0x13 Disconnect yet).
+    // Graceful close: send a Disconnect notification.
+    println!("\n  >> sending Disconnect...");
+    let _ = reliable.disconnect().await;
     drop(reliable);
-    println!("\n  (session closed)");
+    println!("  (session closed)");
 
     Ok(())
 }
