@@ -1,6 +1,6 @@
 //! Minecraft Bedrock / Pocket Edition RakNet utilities.
 //!
-//! This module is split into three submodules:
+//! This module is split into four submodules:
 //!
 //! - [`ping()`] — connectionless **Unconnected Ping** (single UDP round-trip to
 //!   read a server's MOTD / player count, no session established). This is the
@@ -13,6 +13,9 @@
 //! - [`raknet`] — shared **online-format primitives** (offline-message magic,
 //!   the [`PacketBuf`][raknet::PacketBuf] cursor reader, and the IPv4
 //!   system-address codec) reused by both [`ping`] and [`conn`]. Internal only.
+//! - [`datagram`] — connected-layer **wire format** for datagrams, the frames
+//!   they carry, and ACK/NACK packets. Pure encode/decode, no I/O. Internal
+//!   only; the send/receive reliability layer will build on top of it.
 //!
 //! All original public items ([`Client`], [`RequestBuilder`], [`PongResponse`],
 //! [`ping()`], [`MAGIC`]) are re-exported here so the `mcget::bedrock::…` paths
@@ -22,6 +25,8 @@ pub mod conn;
 pub mod ping;
 // Wire-format primitives (magic / PacketBuf / IPv4 system-address codec). Internal.
 mod raknet;
+// Connected-layer wire format: datagrams, frames, ACK/NACK. Internal.
+mod datagram;
 
 pub use ping::{ping as ping_bedrock_inner, Client, PongResponse, RequestBuilder};
 // MAGIC is defined in `raknet` and surfaced here so the public path

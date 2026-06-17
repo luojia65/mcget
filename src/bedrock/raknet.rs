@@ -141,6 +141,25 @@ impl<'a> PacketBuf<'a> {
         Ok(i64::from_be_bytes(arr))
     }
 
+    /// Reads one little-endian 24-bit unsigned integer (3 bytes) into a `u32`
+    /// and advances.
+    ///
+    /// RakNet's connected layer (datagram sequence numbers and the
+    /// reliable/sequenced/ordering indices inside frames) uses 24-bit
+    /// little-endian values everywhere, so this is the natural counterpart to
+    /// the big-endian readers above for the [`super::datagram`] codec.
+    #[allow(dead_code)] // consumed by datagram.rs + its own unit tests
+    pub(crate) fn read_u24_le(&mut self) -> Result<u32, PingError> {
+        self.ensure(3)?;
+        let [b0, b1, b2] = [
+            self.data[self.pos],
+            self.data[self.pos + 1],
+            self.data[self.pos + 2],
+        ];
+        self.pos += 3;
+        Ok(u32::from_le_bytes([b0, b1, b2, 0]))
+    }
+
     /// Reads the next `n` bytes as a borrowed slice and advances.
     pub(crate) fn read_bytes(&mut self, n: usize) -> Result<&'a [u8], PingError> {
         self.ensure(n)?;
@@ -321,6 +340,32 @@ mod tests {
         let buf = [1, 2, 3, 4];
         let mut p = PacketBuf::new(&buf, "Short");
         assert!(p.read_i64().is_err());
+    }
+
+    #[test]
+    fn packetbuf_read_u24_le_decodes_little_endian() {
+        // 0x030201 little-endian on the wire = bytes [0x01, 0x02, 0x03] → value 0x030201.
+        let buf = [0x01, 0x02, 0x03, 0xff];
+        let mut p = PacketBuf::new(&buf, "Test");
+        assert_eq!(p.read_u24_le().unwrap(), 0x030201);
+        assert_eq!(p.pos(), 3, "read_u24_le should advance 3 bytes");
+        assert_eq!(p.peek_u8(), Some(0xff), "next byte should be unconsumed");
+    }
+
+    #[test]
+    fn packetbuf_read_u24_le_max_value() {
+        // All 0xff = 0x00ffffff (24-bit max), high byte must be zero.
+        let buf = [0xff, 0xff, 0xff];
+        let mut p = PacketBuf::new(&buf, "Test");
+        assert_eq!(p.read_u24_le().unwrap(), 0x00ff_ffff);
+    }
+
+    #[test]
+    fn packetbuf_read_u24_le_returns_err_on_short_buffer() {
+        // Only 2 bytes — u24 needs 3.
+        let buf = [0x01, 0x02];
+        let mut p = PacketBuf::new(&buf, "Short");
+        assert!(p.read_u24_le().is_err());
     }
 
     #[test]
